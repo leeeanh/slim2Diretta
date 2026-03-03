@@ -1,4 +1,4 @@
-# slim2diretta v1.0.0
+# slim2diretta v1.1.0
 
 **Native LMS Player with Diretta Output - Mono-Process Architecture**
 
@@ -8,7 +8,7 @@
 
 ---
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 ![DSD](https://img.shields.io/badge/DSD-Native-green.svg)
 ![SDK](https://img.shields.io/badge/SDK-DIRETTA::Sync-orange.svg)
 
@@ -237,6 +237,7 @@ The installer provides an interactive menu with options for:
 - **Update binary** - Rebuild and replace after code changes
 - **Configure network** - MTU, buffers, and firewall
 - **Test** - Verify installation and list Diretta targets
+- **Install web configuration UI** - Browser-based settings (port 8081)
 - **Aggressive optimization** (Fedora only) - For dedicated audio servers
 - **Uninstall** - Clean removal
 
@@ -246,6 +247,7 @@ The installer provides an interactive menu with options for:
 ./install.sh --build      # Build only
 ./install.sh --service    # Install systemd service only
 ./install.sh --update     # Rebuild and update installed binary
+./install.sh --webui      # Install web configuration UI
 ./install.sh --uninstall  # Remove slim2diretta
 ./install.sh --help       # Show all options
 ```
@@ -578,6 +580,44 @@ No special configuration needed for Roon. Simply enable Squeezebox support in Ro
 
 ---
 
+## Web Configuration UI
+
+Configure slim2diretta from your browser — no SSH or manual file editing needed.
+
+### Installation
+
+```bash
+# Via installer menu (option 7)
+./install.sh
+
+# Or directly via command line
+./install.sh --webui
+```
+
+### Usage
+
+Once installed, access the web UI at:
+```
+http://<your-ip>:8081
+```
+
+**Features:**
+- Edit all settings (LMS server IP, player name, verbose mode)
+- Advanced Diretta SDK settings (thread-mode, transfer-mode, cycle-time, etc.)
+- **Save & Restart** — applies settings and restarts the service in one click
+- **Restart Only** — restart the service without changing settings
+
+**Service management:**
+```bash
+sudo systemctl status slim2diretta-webui
+sudo systemctl stop slim2diretta-webui
+sudo systemctl restart slim2diretta-webui
+```
+
+> **Note:** The web UI runs as a separate Python process (`slim2diretta-webui.service`) on port 8081 and has zero impact on audio quality or latency. Port 8081 avoids conflict with DirettaRendererUPnP web UI (port 8080) when both run on the same machine.
+
+---
+
 ## Troubleshooting
 
 ### Player not appearing in LMS
@@ -659,4 +699,4 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 **Enjoy native DSD and hi-res PCM streaming from your LMS library!**
 
-*Last updated: 2026-02-28 (v1.0.0)*
+*Last updated: 2026-03-03 (v1.1.0)*

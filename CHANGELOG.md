@@ -2,6 +2,27 @@
 
 All notable changes to slim2diretta are documented in this file.
 
+## v1.1.0 (2026-03-03)
+
+### Added
+
+- **Web Configuration UI (diretta-webui)**: Browser-based settings interface
+  - Accessible at `http://<ip>:8081` — no SSH needed to configure slim2diretta
+  - Edit all settings: LMS server, player name, verbose mode
+  - Advanced Diretta SDK settings: thread-mode, transfer-mode, cycle-time, info-cycle, target-profile-limit, MTU
+  - Save & Restart: applies settings and restarts the systemd service in one click
+  - Zero dependencies beyond Python 3 (stdlib only)
+  - Separate systemd service (`slim2diretta-webui.service`) — transparent for audio quality
+  - Installable via `install.sh` option 7 or `./install.sh --webui`
+  - Port 8081 to avoid conflict with DirettaRendererUPnP web UI (port 8080)
+
+### Fixed
+
+- **Config parser**: Handle missing `/etc/default/slim2diretta` file (create on first save instead of crash)
+- **Config parser**: Skip duplicate uncommented `SLIM2DIRETTA_OPTS=` lines on save
+
+---
+
 ## v1.0.0 (2026-02-28)
 
 ### Added
