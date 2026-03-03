@@ -192,6 +192,32 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 
 ---
 
+## Upgrading
+
+### From v1.0.0 to v1.1.0
+
+```bash
+# 1. Stop the service
+sudo systemctl stop slim2diretta@1
+
+# 2. Pull the latest version
+cd ~/slim2diretta
+git pull
+
+# 3. Rebuild and update the binary
+./install.sh --update
+
+# 4. Install the web configuration UI (new in v1.1.0)
+./install.sh --webui
+
+# 5. Restart the service
+sudo systemctl start slim2diretta@1
+```
+
+> **What's new in v1.1.0:** Web Configuration UI — configure slim2diretta from your browser at `http://<ip>:8081` instead of editing `/etc/default/slim2diretta` manually. See [Web Configuration UI](#web-configuration-ui) for details.
+
+---
+
 ## Quick Start
 
 ### Option A: Interactive Installer (Recommended)
