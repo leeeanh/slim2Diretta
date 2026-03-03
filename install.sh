@@ -674,7 +674,7 @@ test_installation() {
     # List Diretta targets
     echo ""
     print_info "Searching for Diretta targets..."
-    timeout 10 sudo "$BINARY" --list-targets 2>&1 || {
+    sudo timeout 10 "$BINARY" --list-targets 2>&1 || {
         local exit_code=$?
         if [ $exit_code -eq 124 ]; then
             print_info "Target search timed out (normal if no targets found)"
