@@ -141,15 +141,15 @@ size_t cacheSamplesAvail = 0;
 
 With:
 ```cpp
-// SPSC ring: frame-unit monotonic counters.
+// SPSC ring: sample-unit monotonic counters.
+// Counting in samples (not frames) preserves the original DECODE_CACHE_MAX_SAMPLES
+// depth for all channel counts. Frame-unit helpers convert at the boundary.
 // Producer owns w (local). Sender owns r (local).
 // Only published via atomic store on each commit.
-constexpr size_t DECODE_CACHE_CAPACITY_FRAMES =
-    DECODE_CACHE_MAX_SAMPLES / 2;  // max stereo frames
-alignas(64) std::atomic<size_t> writeSeq{0};  // producer publishes
-alignas(64) std::atomic<size_t> readSeq{0};   // sender  publishes
-size_t w = 0;  // producer-local frame counter
-size_t r = 0;  // sender-local  frame counter (same thread for now)
+alignas(64) std::atomic<size_t> writeSeq{0};  // producer publishes (samples)
+alignas(64) std::atomic<size_t> readSeq{0};   // sender  publishes (samples)
+size_t w = 0;  // producer-local sample counter
+size_t r = 0;  // sender-local  sample counter (same thread for now)
 ```
 
 **Step 2: Replace cache helper lambdas (main.cpp ~794–831)**
@@ -158,46 +158,48 @@ Remove all six existing lambdas (`cacheFrames`, `cacheFreeSamples`, `cacheContig
 
 ```cpp
 // --- Producer-side helpers (use local w, read readSeq) ---
+// cacheFreeFrames: before format detection uses detectedChannels default (2).
+// Same behaviour as original code which also defaulted to 2.
 auto cacheFreeFrames = [&]() -> size_t {
+    int ch = std::max(detectedChannels, 1);
     size_t r_snap = readSeq.load(std::memory_order_acquire);
-    return DECODE_CACHE_CAPACITY_FRAMES - (w - r_snap);
+    return (DECODE_CACHE_MAX_SAMPLES - (w - r_snap)) / static_cast<size_t>(ch);
 };
 // Push decoded frames into SPSC ring. Returns frames actually written.
 auto cachePushFrames = [&](const int32_t* src, size_t frames) -> size_t {
     int ch = std::max(detectedChannels, 1);
-    size_t free = cacheFreeFrames();
-    size_t toWrite = std::min(frames, free);
+    size_t samples = frames * static_cast<size_t>(ch);
+    size_t r_snap  = readSeq.load(std::memory_order_acquire);
+    size_t free    = DECODE_CACHE_MAX_SAMPLES - (w - r_snap);
+    size_t toWrite = std::min(samples, free);
     if (toWrite == 0) return 0;
-    size_t pos = w % DECODE_CACHE_CAPACITY_FRAMES;
-    size_t toEnd = DECODE_CACHE_CAPACITY_FRAMES - pos;  // frames before wrap
+    size_t pos  = w % DECODE_CACHE_MAX_SAMPLES;
+    size_t toEnd = DECODE_CACHE_MAX_SAMPLES - pos;
     size_t first = std::min(toWrite, toEnd);
-    std::memcpy(decodeCache.data() + pos * ch,
-                src, first * ch * sizeof(int32_t));
-    if (toWrite > first) {
-        std::memcpy(decodeCache.data(),
-                    src + first * ch,
-                    (toWrite - first) * ch * sizeof(int32_t));
-    }
+    std::memcpy(decodeCache.data() + pos,  src,         first   * sizeof(int32_t));
+    if (toWrite > first)
+        std::memcpy(decodeCache.data(),    src + first, (toWrite - first) * sizeof(int32_t));
     writeSeq.store(w += toWrite, std::memory_order_release);
-    return toWrite;
+    return toWrite / static_cast<size_t>(ch);  // frames written
 };
 
 // --- Sender-side helpers (use local r, read writeSeq) ---
 auto cacheAvailFrames = [&]() -> size_t {
-    return writeSeq.load(std::memory_order_acquire) - r;
+    int ch = std::max(detectedChannels, 1);
+    return (writeSeq.load(std::memory_order_acquire) - r) / static_cast<size_t>(ch);
 };
 auto cacheContiguousFrames = [&]() -> size_t {
-    size_t avail = cacheAvailFrames();
-    size_t pos   = r % DECODE_CACHE_CAPACITY_FRAMES;
-    size_t toEnd = DECODE_CACHE_CAPACITY_FRAMES - pos;
-    return std::min(avail, toEnd);
+    int ch    = std::max(detectedChannels, 1);
+    size_t pos = r % DECODE_CACHE_MAX_SAMPLES;
+    size_t toEnd = (DECODE_CACHE_MAX_SAMPLES - pos) / static_cast<size_t>(ch);
+    return std::min(cacheAvailFrames(), toEnd);
 };
 auto cacheReadPtr = [&]() -> const int32_t* {
-    int ch = std::max(detectedChannels, 1);
-    return decodeCache.data() + (r % DECODE_CACHE_CAPACITY_FRAMES) * ch;
+    return decodeCache.data() + (r % DECODE_CACHE_MAX_SAMPLES);
 };
 auto cachePopFrames = [&](size_t frames) {
-    readSeq.store(r += frames, std::memory_order_release);
+    int ch = std::max(detectedChannels, 1);
+    readSeq.store(r += frames * static_cast<size_t>(ch), std::memory_order_release);
 };
 ```
 
@@ -208,9 +210,9 @@ Replace every call to the old lambdas with the new ones. Mapping:
 | Old call | New call |
 |---|---|
 | `cacheFrames()` | `cacheAvailFrames()` |
-| `cacheFreeSamples()` | `cacheFreeFrames() * ch` (only used in decoder drain size calc) |
+| `cacheFreeSamples()` | `cacheFreeFrames() * ch` — no longer needed; use `cacheFreeFrames()` directly |
 | `cachePushSamples(decodeBuf, frames * ch)` | `cachePushFrames(decodeBuf, frames)` |
-| `cachePopFrames(chunk)` | unchanged (already frames) |
+| `cachePopFrames(chunk)` | unchanged (still takes frames) |
 | `cacheReadPtr()` | unchanged signature |
 | `cacheContiguousFrames()` | unchanged signature |
 
@@ -285,7 +287,8 @@ These atomics are the handshake between producer and sender. Add them immediatel
 // after the corresponding acquire load in the sender.
 std::atomic<bool> audioFmtReady{false};
 std::atomic<bool> prebufferReady{false};
-std::atomic<bool> producerDone{false};   // producer sets when HTTP+decode finished
+std::atomic<bool> producerDone{false};      // producer sets when HTTP+decode finished
+std::atomic<bool> senderOpenedDiretta{false}; // sender sets after direttaPtr->open() succeeds
 
 // Snapshots published by producer before audioFmtReady.store(true, release).
 // Sender reads these after seeing audioFmtReady — no decoder access needed.
@@ -484,11 +487,10 @@ std::thread senderThread([&]() {
     }
     if (!audioTestRunning.load(std::memory_order_acquire)) return;
 
-    // If producer ended with no format detected (empty/error stream), exit clean.
-    if (!audioFmtReady.load(std::memory_order_acquire) &&
-        producerDone.load(std::memory_order_acquire) &&
-        cacheAvailFrames() == 0) {
-        LOG_WARN("[Sender] Producer finished without format — nothing to play");
+    // No format means nothing valid to open — exit regardless of cache contents.
+    // Any cached frames without a format are garbage (could be mid-header bytes).
+    if (!audioFmtReady.load(std::memory_order_acquire)) {
+        LOG_WARN("[Sender] No valid format detected — cannot open Diretta");
         return;
     }
 
@@ -518,11 +520,16 @@ std::thread senderThread([&]() {
     if (!direttaPtr->open(audioFmt)) {
         LOG_ERROR("[Sender] Failed to open Diretta output");
         slimproto->sendStat(StatEvent::STMn);
+        // Signal producer to stop so producerThread.join() does not hang.
+        audioTestRunning.store(false, std::memory_order_release);
+        direttaPtr->notifySpaceAvailable();  // wake any blocked waits
         return;
+        // senderOpenedDiretta remains false — join block skips STMd/STMu.
     }
     if (!dopDetected) {
         direttaPtr->setS24PackModeHint(DirettaRingBuffer::S24PackMode::MsbAligned);
     }
+    senderOpenedDiretta.store(true, std::memory_order_release);
     direttaOpened = true;
     slimproto->sendStat(StatEvent::STMl);
 
@@ -638,20 +645,23 @@ Replace the existing `slimproto->sendStat(STMd)` / `STMu` / `audioThreadDone` bl
 producerThread.join();
 senderThread.join();
 
-// Final elapsed
-if (decoder->isFormatReady()) {
-    auto fmt = decoder->getFormat();
-    uint64_t decoded = decoder->getDecodedSamples();
-    uint32_t elapsedSec = fmt.sampleRate > 0
-        ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
-    LOG_INFO("[Audio] Stream complete: " << totalBytes << " bytes received, "
-             << decoded << " frames decoded (" << elapsedSec << "s)");
-} else {
-    LOG_INFO("[Audio] Stream ended (" << totalBytes << " bytes received)");
+// STMd/STMu only if Diretta was successfully opened and stream actually ran.
+// If sender returned early (open failure, no format), STMn was already sent —
+// sending STMd/STMu afterward would be a contradictory status sequence.
+if (senderOpenedDiretta.load(std::memory_order_acquire)) {
+    if (decoder->isFormatReady()) {
+        auto fmt = decoder->getFormat();
+        uint64_t decoded = decoder->getDecodedSamples();
+        uint32_t elapsedSec = fmt.sampleRate > 0
+            ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
+        LOG_INFO("[Audio] Stream complete: " << totalBytes << " bytes, "
+                 << decoded << " frames decoded (" << elapsedSec << "s)");
+    } else {
+        LOG_INFO("[Audio] Stream ended (" << totalBytes << " bytes received)");
+    }
+    slimproto->sendStat(StatEvent::STMd);
+    slimproto->sendStat(StatEvent::STMu);
 }
-
-slimproto->sendStat(StatEvent::STMd);
-slimproto->sendStat(StatEvent::STMu);
 audioThreadDone.store(true, std::memory_order_release);
 ```
 
