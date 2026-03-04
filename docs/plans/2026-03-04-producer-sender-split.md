@@ -4,7 +4,7 @@
 
 **Goal:** Decouple HTTP/decode from DirettaSync pushes in the PCM path by splitting the single audio loop into a producer thread (HTTP + decode → SPSC ring) and a sender thread (SPSC ring → sendAudio, woken by hardware epoch signal).
 
-**Architecture:** Two SPSC monotonic counters (`writeSeq` / `readSeq`, frame units, `alignas(64)`) replace the current three shared cache variables. The sender blocks on a predicate-based `waitForSpace` driven by `m_popEpoch` incremented in the SDK worker pop callback — giving hardware-clock-rate wakeups with no software timer jitter. DSD path is untouched.
+**Architecture:** Two SPSC monotonic counters (`writeSeq` / `readSeq`, sample units, `alignas(64)`) replace the current three shared cache variables. Frame-unit helpers (`cacheFreeFrames`, `cacheAvailFrames`, etc.) divide by `detectedChannels` at the boundary, preserving the original buffer depth for all channel counts. The sender blocks on a predicate-based `waitForSpace` driven by `m_popEpoch` incremented in the SDK worker pop callback — giving hardware-clock-rate wakeups with no software timer jitter. DSD path is untouched.
 
 **Tech Stack:** C++17, pthreads, existing `DirettaSync` flow-control API (`getFlowMutex`, `waitForSpace`, `notifySpaceAvailable`), libFLAC
 
@@ -15,10 +15,10 @@
 - **Untouched:** DSD path (`FORMAT_DSD`, `main.cpp:534–738`), `HttpStreamClient`, all decoders, `SlimprotoClient`, `DirettaRingBuffer`.
 - **Changed:** `DirettaSync.h` / `.cpp` (epoch), PCM branch of audio lambda (`main.cpp:745–1192`).
 - **Key constants:**
-  - `DECODE_CACHE_MAX_SAMPLES = 3072000` — stays as allocated size (samples)
-  - `DECODE_CACHE_CAPACITY_FRAMES = 3072000 / 2 = 1536000` — max stereo frames in ring
+  - `DECODE_CACHE_MAX_SAMPLES = 3072000` — ring capacity in samples (unchanged)
   - `MAX_DECODE_FRAMES = 1024` — max frames per push/pop chunk
   - `PREBUFFER_MS = 500`
+  - No `DECODE_CACHE_CAPACITY_FRAMES` constant — ring counters are sample-unit; frame helpers divide by `detectedChannels` at the call site, matching original depth for all channel counts.
 
 ---
 
@@ -287,8 +287,10 @@ These atomics are the handshake between producer and sender. Add them immediatel
 // after the corresponding acquire load in the sender.
 std::atomic<bool> audioFmtReady{false};
 std::atomic<bool> prebufferReady{false};
-std::atomic<bool> producerDone{false};      // producer sets when HTTP+decode finished
+std::atomic<bool> producerDone{false};        // producer sets when HTTP+decode finished
 std::atomic<bool> senderOpenedDiretta{false}; // sender sets after direttaPtr->open() succeeds
+std::atomic<bool> streamError{false};         // set by producer/sender on genuine errors
+                                              // (not on user-initiated stop)
 
 // Snapshots published by producer before audioFmtReady.store(true, release).
 // Sender reads these after seeing audioFmtReady — no decoder access needed.
@@ -410,6 +412,7 @@ std::thread producerThread([&]() {
 
         if (decoder->hasError()) {
             LOG_ERROR("[Producer] Decoder error");
+            streamError.store(true, std::memory_order_release);
             break;
         }
     }
@@ -491,6 +494,7 @@ std::thread senderThread([&]() {
     // Any cached frames without a format are garbage (could be mid-header bytes).
     if (!audioFmtReady.load(std::memory_order_acquire)) {
         LOG_WARN("[Sender] No valid format detected — cannot open Diretta");
+        streamError.store(true, std::memory_order_release);
         return;
     }
 
@@ -523,8 +527,9 @@ std::thread senderThread([&]() {
         // Signal producer to stop so producerThread.join() does not hang.
         audioTestRunning.store(false, std::memory_order_release);
         direttaPtr->notifySpaceAvailable();  // wake any blocked waits
+        // senderOpenedDiretta=false, streamError=false → join block sends nothing
+        // (STMn already sent above). Do NOT set streamError here.
         return;
-        // senderOpenedDiretta remains false — join block skips STMd/STMu.
     }
     if (!dopDetected) {
         direttaPtr->setS24PackModeHint(DirettaRingBuffer::S24PackMode::MsbAligned);
@@ -645,9 +650,12 @@ Replace the existing `slimproto->sendStat(STMd)` / `STMu` / `audioThreadDone` bl
 producerThread.join();
 senderThread.join();
 
-// STMd/STMu only if Diretta was successfully opened and stream actually ran.
-// If sender returned early (open failure, no format), STMn was already sent —
-// sending STMd/STMu afterward would be a contradictory status sequence.
+// Terminal STAT logic (exactly one terminal event per stream):
+//   senderOpenedDiretta → stream played → STMd + STMu
+//   streamError         → genuine failure → STMn
+//                         (open() failure already sent STMn from sender thread,
+//                          so that path sets streamError=false, no double-send)
+//   neither             → user-initiated stop → STMf already sent by stop handler
 if (senderOpenedDiretta.load(std::memory_order_acquire)) {
     if (decoder->isFormatReady()) {
         auto fmt = decoder->getFormat();
@@ -661,6 +669,10 @@ if (senderOpenedDiretta.load(std::memory_order_acquire)) {
     }
     slimproto->sendStat(StatEvent::STMd);
     slimproto->sendStat(StatEvent::STMu);
+} else if (streamError.load(std::memory_order_acquire)) {
+    // Decode error or no-format exit — stream started (STMs sent) but never played.
+    // open()-failure path already sent STMn directly; it must NOT set streamError.
+    slimproto->sendStat(StatEvent::STMn);
 }
 audioThreadDone.store(true, std::memory_order_release);
 ```
