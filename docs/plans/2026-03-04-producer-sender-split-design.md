@@ -40,35 +40,40 @@ The audio thread itself only spawns and joins the two sub-threads, then handles
 Replace `cacheReadPos` / `cacheWritePos` / `cacheSamplesAvail` (three shared variables,
 two writers) with two single-owner monotonic sequence counters.
 
+**Unit: frames throughout.** `sendAudio()` takes frames in the PCM path; keeping counters
+in frames avoids a `* channels` multiply in the hot path and keeps accounting consistent.
+
 ```cpp
-alignas(64) std::atomic<size_t> writeSeq{0};  // producer ONLY writes
-alignas(64) std::atomic<size_t> readSeq{0};   // sender   ONLY writes
-std::vector<int32_t> decodeCache;             // unchanged, power-of-2 capacity
+alignas(64) std::atomic<size_t> writeSeq{0};  // producer ONLY writes, counts frames
+alignas(64) std::atomic<size_t> readSeq{0};   // sender   ONLY writes, counts frames
+std::vector<int32_t> decodeCache;             // existing buffer, indexed by sample
+                                              // (frame * channels + ch)
 ```
 
 `alignas(64)` prevents false sharing between producer and sender cache lines.
-Capacity must be a power of 2 so indexing uses `& (capacity - 1)` instead of `%`.
+Existing `decodeCache` capacity and `%`-based indexing are unchanged.
 
 ### Producer side
 
 ```cpp
-size_t w = 0;  // local — never accessed by sender
+size_t w = 0;  // local frame counter — never accessed by sender
 // per iteration:
-size_t r   = readSeq.load(std::memory_order_acquire);
-size_t free = capacity - (w - r);
-// write samples into decodeCache[w & (capacity-1)]
-writeSeq.store(w += written, std::memory_order_release);
+size_t r     = readSeq.load(std::memory_order_acquire);         // frames
+size_t free  = capacity_frames - (w - r);                       // frames
+// write decoded frames into decodeCache[(w % capacity_frames) * channels ...]
+writeSeq.store(w += written_frames, std::memory_order_release);
 ```
 
 ### Sender side
 
 ```cpp
-size_t r = 0;  // local — never accessed by producer
+size_t r = 0;  // local frame counter — never accessed by producer
 // per iteration:
-size_t w   = writeSeq.load(std::memory_order_acquire);
-size_t avail = w - r;
-// read samples from decodeCache[r & (capacity-1)]
-readSeq.store(r += consumed, std::memory_order_release);
+size_t w     = writeSeq.load(std::memory_order_acquire);        // frames
+size_t avail = w - r;                                           // frames
+// read frames from decodeCache[(r % capacity_frames) * channels ...]
+// call sendAudio(ptr, consumed_frames)
+readSeq.store(r += consumed_frames, std::memory_order_release);
 ```
 
 One acquire load + one release store per iteration on each side. No shared-write
@@ -100,9 +105,17 @@ if (m_flowMutex.try_lock()) {                        // best-effort notify
 }
 ```
 
-Epoch is incremented unconditionally. Even if `try_lock` fails (sender briefly holds
-mutex during predicate re-check), the epoch change is visible on the next predicate
-evaluation. The 2ms timeout is worst-case latency only for the try_lock-miss edge case.
+Epoch is incremented unconditionally before the `try_lock`. Even if `try_lock` fails
+(sender briefly holds mutex during predicate re-check), the epoch change is already
+visible. On the next predicate evaluation — whether from a spurious wakeup or the 2ms
+timeout — the sender sees `epoch != seenEpoch` and unblocks. The 2ms timeout is
+worst-case latency only for the try_lock-miss edge case.
+
+Note: `notify_one()` does not acquire `m_flowMutex`. The `try_lock` gate exists solely
+to avoid any blocking on the time-critical DAC callback thread. If the callback budget
+allows even a brief `notify_one()` call unconditionally, the `try_lock` can be dropped
+entirely — the epoch scheme already prevents lost wakeups, making the timeout fallback
+very rare.
 
 ### Sender wait loop
 
@@ -121,45 +134,44 @@ while (audioTestRunning.load(std::memory_order_acquire)) {
     }
     seenEpoch = direttaPtr->getPopEpoch();
 
-    size_t w = writeSeq.load(std::memory_order_acquire);
-    size_t avail = w - r;
+    size_t w     = writeSeq.load(std::memory_order_acquire);
+    size_t avail = w - r;                         // frames
     if (avail == 0) continue;
 
-    size_t chunk = std::min(avail, MAX_DECODE_FRAMES);
-    // pop from decodeCache → sendAudio()
+    size_t chunk = std::min(avail, MAX_DECODE_FRAMES);   // frames
+    // pop chunk frames from decodeCache → sendAudio(ptr, chunk)
     readSeq.store(r += chunk, std::memory_order_release);
 }
 ```
 
 ### Stop / flush
 
-On stop or stream flush, after setting `audioTestRunning = false`:
+On stop or stream flush, set `audioTestRunning = false`, then wake the sender:
 
 ```cpp
-{
-    std::lock_guard<std::mutex> lk(direttaPtr->getFlowMutex());
-    // ensures sender is not mid-predicate-check
-}
-direttaPtr->notifySpaceAvailable();  // wakes sender immediately, exits wait
+audioTestRunning.store(false, std::memory_order_release);
+direttaPtr->notifySpaceAvailable();  // sender predicate sees !audioTestRunning → exits
 ```
 
-Sender predicate sees `audioTestRunning == false` → exits without waiting for timeout.
+The sender exits via the predicate (`!audioTestRunning`) on the next wakeup — either
+from the notify or from the 2ms timeout fallback. No lock block is needed here;
+correctness relies on the predicate, not on synchronizing with the mutex.
 
 ---
 
 ## Shared State Between Producer and Sender
 
-| Variable | Owner | Other side |
-|---|---|---|
-| `writeSeq` | producer writes (release) | sender reads (acquire) |
-| `readSeq` | sender writes (release) | producer reads (acquire) |
-| `decodeCache[]` | producer writes `[w&mask]` | sender reads `[r&mask]` — non-overlapping |
-| `audioFmt` | producer writes once (before `audioFmtReady`) | sender reads after flag |
-| `dopDetected` | producer writes once | sender reads after `audioFmtReady` |
-| `audioFmtReady` | producer sets (release) | sender polls (acquire) |
-| `prebufferReady` | producer sets (release) | sender polls — gates `direttaPtr->open()` |
-| `httpEof` | producer sets (release) | sender: exit when `httpEof && avail == 0` |
-| `audioTestRunning` | outer audio thread | both threads read |
+| Variable | Unit | Owner | Other side |
+|---|---|---|---|
+| `writeSeq` | frames | producer writes (release) | sender reads (acquire) |
+| `readSeq` | frames | sender writes (release) | producer reads (acquire) |
+| `decodeCache[]` | samples | producer writes `[w%cap * ch..]` | sender reads `[r%cap * ch..]` — non-overlapping |
+| `audioFmt` | — | producer writes once (before `audioFmtReady`) | sender reads after flag |
+| `dopDetected` | — | producer writes once | sender reads after `audioFmtReady` |
+| `audioFmtReady` | — | producer sets (release) | sender polls (acquire) |
+| `prebufferReady` | — | producer sets (release) | sender polls — gates `direttaPtr->open()` |
+| `httpEof` | — | producer sets (release) | sender: exit when `httpEof && avail == 0` |
+| `audioTestRunning` | — | outer audio thread sets | both threads read |
 
 ---
 
@@ -167,16 +179,6 @@ Sender predicate sees `audioTestRunning == false` → exits without waiting for 
 
 | File | Change |
 |---|---|
-| `src/main.cpp` | Split audio lambda into producer thread + sender thread; replace cache index vars with `writeSeq`/`readSeq`; add `audioFmtReady`, `prebufferReady`, `httpEof` atomics; stop path calls `notifySpaceAvailable()` |
+| `src/main.cpp` | Split audio lambda into producer thread + sender thread; replace cache index vars with `writeSeq`/`readSeq` (frames); add `audioFmtReady`, `prebufferReady`, `httpEof` atomics; stop path calls `notifySpaceAvailable()` |
 | `diretta/DirettaSync.h` | Add `m_popEpoch` atomic + `getPopEpoch()`; add predicate overload of `waitForSpace` |
 | `diretta/DirettaSync.cpp` | Add `m_popEpoch.fetch_add` before `try_lock` in SDK pop callback |
-
----
-
-## Optional Improvements (not blocking)
-
-- Drop `try_lock` in SDK callback → plain `notify_one()`: epoch scheme makes timeout
-  fallback rare; removing `try_lock` simplifies code and eliminates the missed-notify
-  case entirely (safe if SDK callback budget allows a brief mutex acquisition).
-- Power-of-2 `decodeCache` capacity: enforced in constructor, enables `& (capacity-1)`
-  index masking.
