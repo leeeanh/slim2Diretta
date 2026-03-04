@@ -336,8 +336,10 @@ Inside the PCM lambda (after the shared state declarations, before the existing 
 std::thread producerThread([&]() {
     // Loop exits as soon as HTTP EOF is reached.
     // Does NOT wait for the sender to drain — that is sender's responsibility.
-    bool httpEof = false;
-    while (audioTestRunning.load(std::memory_order_acquire) && !httpEof) {
+    // Use producerEof (not httpEof) to avoid shadowing the outer-scope httpEof
+    // which the old Phase 3–6 still reference until Task 6 removes them.
+    bool producerEof = false;
+    while (audioTestRunning.load(std::memory_order_acquire) && !producerEof) {
 
         // ---- Phase 1a: HTTP read ----
         bool gotData = false;
@@ -350,11 +352,11 @@ std::thread producerThread([&]() {
                     slimproto->updateStreamBytes(totalBytes);
                     decoder->feed(httpBuf, static_cast<size_t>(n));
                 } else if (n < 0 || !httpStream->isConnected()) {
-                    httpEof = true;
+                    producerEof = true;
                     decoder->setEof();
                 }
             } else {
-                httpEof = true;
+                producerEof = true;
                 decoder->setEof();
             }
         }
@@ -396,19 +398,19 @@ std::thread producerThread([&]() {
         }
 
         // ---- Prebuffer threshold: signal sender when enough frames ready ----
-        // Force prebufferReady on httpEof so sender is never blocked by a
+        // Force prebufferReady on producerEof so sender is never blocked by a
         // short stream that never reaches the target frame count.
         if (audioFmtReady.load(std::memory_order_relaxed) &&
             !prebufferReady.load(std::memory_order_relaxed)) {
             size_t targetFrames =
                 static_cast<size_t>(snapshotSampleRate) * PREBUFFER_MS / 1000;
-            if (cacheAvailFrames() >= targetFrames || httpEof) {
+            if (cacheAvailFrames() >= targetFrames || producerEof) {
                 prebufferReady.store(true, std::memory_order_release);
             }
         }
 
         // Anti-busy-loop: only when genuinely idle (no data, waiting for HTTP)
-        if (!gotData && !httpEof) {
+        if (!gotData && !producerEof) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
@@ -447,11 +449,17 @@ std::thread producerThread([&]() {
 });
 ```
 
-**Step 2: Remove the old Phase 1a, 1b, 2 code and drain from the outer loop**
+**Step 2: Remove Phase 1a, 1b, 2, and Phase 5 from the outer loop**
 
-The outer while-loop (lines ~834–1089) and drain section (lines ~1091–1176) now belong to the sender (Task 6). For now, remove the producer-side phases from the outer loop so they don't run twice. Leave Phase 3, 4, 5, 6 in place temporarily.
+Remove these sections from the outer while-loop:
+- Phase 1a (HTTP read, ~lines 837–858)
+- Phase 1b (decoder drain, ~lines 860–878)
+- Phase 2 (format detection, ~lines 880–894)
+- **Phase 5 (elapsed update, ~lines 1055–1078)** — producer now owns `decoder`; leaving `decoder->isFormatReady()` / `decoder->getFormat()` in the outer loop while `producerThread` is also running creates a data race
 
-Also remove the `bool httpEof = false;` declaration at line 833 from the outer scope (it's now local to producerThread).
+Leave Phase 3, 4, and 6 in the outer loop for now (Task 6 will replace them).
+
+Do **NOT** remove `bool httpEof = false` from the outer scope at line 833 — Phase 3 (`if (cacheFrames() >= targetFrames || httpEof)`) and the outer loop condition still reference it. The producer uses its own `producerEof`. The outer `httpEof` will be deleted in Task 6 when the entire outer loop is replaced.
 
 **Step 3: Build**
 
@@ -459,7 +467,7 @@ Also remove the `bool httpEof = false;` declaration at line 833 from the outer s
 cd build && make -j$(nproc) 2>&1 | tail -20
 ```
 
-Fix any compile errors (missing captures, variable scope). The producer thread lambda needs to capture: `[&]` works since all variables are in the same enclosing lambda scope.
+Fix any compile errors. Expected warnings: `httpEof` set but not changed (outer scope, now always false — that is intentional and temporary). The `[&]` capture on `producerThread` covers all variables in the enclosing lambda scope.
 
 **Step 4: Commit**
 
