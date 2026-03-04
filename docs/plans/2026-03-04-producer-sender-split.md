@@ -289,6 +289,8 @@ std::atomic<bool> audioFmtReady{false};
 std::atomic<bool> prebufferReady{false};
 std::atomic<bool> producerDone{false};        // producer sets when HTTP+decode finished
 std::atomic<bool> senderOpenedDiretta{false}; // sender sets after direttaPtr->open() succeeds
+std::atomic<bool> naturalStreamEnd{false};    // sender sets ONLY on clean producerDone+drain exit
+                                              // NOT set on user stop or error
 std::atomic<bool> streamError{false};         // set by producer/sender on genuine errors
                                               // (not on user-initiated stop)
 
@@ -580,9 +582,14 @@ std::thread senderThread([&]() {
     };
 
     while (audioTestRunning.load(std::memory_order_acquire)) {
-        // Exit when producer is done and ring is drained
+        // Natural exit: producer done and ring fully drained.
+        // Set naturalStreamEnd BEFORE breaking so join block can distinguish
+        // this from a user-stop exit (where audioTestRunning becomes false).
         if (producerDone.load(std::memory_order_acquire) &&
-            cacheAvailFrames() == 0) break;
+            cacheAvailFrames() == 0) {
+            naturalStreamEnd.store(true, std::memory_order_release);
+            break;
+        }
 
         // Block on hardware epoch signal (SDK worker pop)
         {
@@ -650,13 +657,22 @@ Replace the existing `slimproto->sendStat(STMd)` / `STMu` / `audioThreadDone` bl
 producerThread.join();
 senderThread.join();
 
-// Terminal STAT logic (exactly one terminal event per stream):
-//   senderOpenedDiretta → stream played → STMd + STMu
-//   streamError         → genuine failure → STMn
-//                         (open() failure already sent STMn from sender thread,
-//                          so that path sets streamError=false, no double-send)
-//   neither             → user-initiated stop → STMf already sent by stop handler
-if (senderOpenedDiretta.load(std::memory_order_acquire)) {
+// Terminal STAT logic — exactly one terminal event per stream.
+// Priority order matters:
+//   1. streamError (highest priority) → STMn
+//      Covers: decode error mid-stream, no-format exit.
+//      Must be checked first so a mid-stream error is not masked by
+//      senderOpenedDiretta being true (Diretta was opened but stream failed).
+//      open()-failure sends STMn directly and does NOT set streamError.
+//   2. senderOpenedDiretta && naturalStreamEnd → STMd + STMu
+//      Diretta opened AND stream completed cleanly.
+//      naturalStreamEnd is only set when sender exits via producerDone+drain,
+//      NOT on user stop — prevents STMf + STMd/STMu double-send.
+//   3. neither → user-initiated stop → STMf already sent by stop handler.
+if (streamError.load(std::memory_order_acquire)) {
+    slimproto->sendStat(StatEvent::STMn);
+} else if (senderOpenedDiretta.load(std::memory_order_acquire) &&
+           naturalStreamEnd.load(std::memory_order_acquire)) {
     if (decoder->isFormatReady()) {
         auto fmt = decoder->getFormat();
         uint64_t decoded = decoder->getDecodedSamples();
@@ -669,11 +685,8 @@ if (senderOpenedDiretta.load(std::memory_order_acquire)) {
     }
     slimproto->sendStat(StatEvent::STMd);
     slimproto->sendStat(StatEvent::STMu);
-} else if (streamError.load(std::memory_order_acquire)) {
-    // Decode error or no-format exit — stream started (STMs sent) but never played.
-    // open()-failure path already sent STMn directly; it must NOT set streamError.
-    slimproto->sendStat(StatEvent::STMn);
 }
+// else: user stop — STMf already sent by the stop/flush handler. Nothing to do.
 audioThreadDone.store(true, std::memory_order_release);
 ```
 
