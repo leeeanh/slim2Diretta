@@ -280,15 +280,21 @@ These atomics are the handshake between producer and sender. Add them immediatel
 
 ```cpp
 // --- Shared state: producer writes once, sender reads after flag ---
-// audioFmt and dopDetected are written by producer before audioFmtReady.store(true).
-// After audioFmtReady is seen, sender can read them without a lock.
+// Classic C++ publication idiom: non-atomic writes are safe when sequenced
+// before the release store (audioFmtReady), and non-atomic reads happen
+// after the corresponding acquire load in the sender.
 std::atomic<bool> audioFmtReady{false};
 std::atomic<bool> prebufferReady{false};
 std::atomic<bool> producerDone{false};   // producer sets when HTTP+decode finished
-// dopDetected, dopPcmRate, dopBuf, audioFmt already declared below — keep as-is.
-// detectedChannels: producer writes, sender reads after audioFmtReady.
-// Declare as shared atomic to avoid data race after thread split.
-std::atomic<int> sharedChannels{2};  // default stereo; updated by producer
+
+// Snapshots published by producer before audioFmtReady.store(true, release).
+// Sender reads these after seeing audioFmtReady — no decoder access needed.
+uint32_t snapshotSampleRate = 0;   // audioFmt.sampleRate, published via audioFmtReady
+uint32_t snapshotTotalSec   = 0;   // fmt.totalSamples / sampleRate (0 if unknown)
+
+// detectedChannels: producer writes once before audioFmtReady, sender reads after.
+// Plain int is safe via the audioFmtReady release/acquire pair.
+// (dopDetected, dopPcmRate, dopBuf, audioFmt already declared below — keep as-is.)
 ```
 
 **Step 2: Build**
@@ -321,14 +327,14 @@ Inside the PCM lambda (after the shared state declarations, before the existing 
 
 ```cpp
 std::thread producerThread([&]() {
-    // Phase 1a + 1b + 2: HTTP read, decode, format detection
+    // Loop exits as soon as HTTP EOF is reached.
+    // Does NOT wait for the sender to drain — that is sender's responsibility.
     bool httpEof = false;
-    while (audioTestRunning.load(std::memory_order_acquire) &&
-           (!httpEof || cacheFreeFrames() < DECODE_CACHE_CAPACITY_FRAMES)) {
+    while (audioTestRunning.load(std::memory_order_acquire) && !httpEof) {
 
         // ---- Phase 1a: HTTP read ----
         bool gotData = false;
-        if (cacheFreeFrames() > 0 && !httpEof) {
+        if (cacheFreeFrames() > 0) {
             if (httpStream->isConnected()) {
                 ssize_t n = httpStream->readWithTimeout(httpBuf, sizeof(httpBuf), 2);
                 if (n > 0) {
@@ -366,31 +372,36 @@ std::thread producerThread([&]() {
             auto fmt = decoder->getFormat();
             LOG_INFO("[Audio] Decoding: " << fmt.sampleRate << " Hz, "
                      << fmt.bitDepth << "-bit, " << fmt.channels << " ch");
-            detectedChannels = fmt.channels;
-            sharedChannels.store(detectedChannels, std::memory_order_relaxed);
-            audioFmt.sampleRate  = fmt.sampleRate;
-            audioFmt.bitDepth    = 32;
-            audioFmt.channels    = fmt.channels;
+            detectedChannels  = fmt.channels;
+            audioFmt.sampleRate   = fmt.sampleRate;
+            audioFmt.bitDepth     = 32;
+            audioFmt.channels     = fmt.channels;
             audioFmt.isCompressed = (formatCode == FORMAT_FLAC ||
                                      formatCode == FORMAT_MP3  ||
                                      formatCode == FORMAT_OGG  ||
                                      formatCode == FORMAT_AAC);
+            // Publish snapshots for sender (no decoder access after this point)
+            snapshotSampleRate = fmt.sampleRate;
+            snapshotTotalSec   = (fmt.totalSamples > 0 && fmt.sampleRate > 0)
+                                 ? static_cast<uint32_t>(fmt.totalSamples / fmt.sampleRate)
+                                 : 0;
             audioFmtReady.store(true, std::memory_order_release);
         }
 
         // ---- Prebuffer threshold: signal sender when enough frames ready ----
+        // Force prebufferReady on httpEof so sender is never blocked by a
+        // short stream that never reaches the target frame count.
         if (audioFmtReady.load(std::memory_order_relaxed) &&
             !prebufferReady.load(std::memory_order_relaxed)) {
-            auto fmt = decoder->getFormat();
             size_t targetFrames =
-                static_cast<size_t>(fmt.sampleRate) * PREBUFFER_MS / 1000;
+                static_cast<size_t>(snapshotSampleRate) * PREBUFFER_MS / 1000;
             if (cacheAvailFrames() >= targetFrames || httpEof) {
                 prebufferReady.store(true, std::memory_order_release);
             }
         }
 
-        // Anti-busy-loop when no data and cache has room
-        if (!gotData && cacheFreeFrames() == DECODE_CACHE_CAPACITY_FRAMES && !httpEof) {
+        // Anti-busy-loop: only when genuinely idle (no data, waiting for HTTP)
+        if (!gotData && !httpEof) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
@@ -400,7 +411,9 @@ std::thread producerThread([&]() {
         }
     }
 
-    // Post-EOF decoder drain: flush any remaining frames from decoder
+    // Post-EOF decoder drain: push remaining decoder frames into ring.
+    // Ring may be full — yield 1ms and retry rather than spinning.
+    // Does NOT wait for sender to consume; exits as soon as decoder is empty.
     decoder->setEof();
     while (!decoder->isFinished() && !decoder->hasError() &&
            audioTestRunning.load(std::memory_order_acquire)) {
@@ -413,6 +426,12 @@ std::thread producerThread([&]() {
                             std::min(MAX_DECODE_FRAMES, free));
         if (frames == 0) break;
         cachePushFrames(decodeBuf, frames);
+    }
+
+    // If format was never detected (very short or empty stream), force
+    // prebufferReady so sender does not hang waiting for it.
+    if (!prebufferReady.load(std::memory_order_relaxed)) {
+        prebufferReady.store(true, std::memory_order_release);
     }
 
     producerDone.store(true, std::memory_order_release);
@@ -456,19 +475,32 @@ Remove the existing while-loop (lines ~834–1089) and drain (lines ~1091–1176
 
 ```cpp
 std::thread senderThread([&]() {
-    // Wait until producer has detected format and buffered enough
+    // Wait until producer has buffered enough — OR producer finished early
+    // (decode error, very short stream). Both cases set prebufferReady.
     while (audioTestRunning.load(std::memory_order_acquire) &&
-           !prebufferReady.load(std::memory_order_acquire)) {
+           !prebufferReady.load(std::memory_order_acquire) &&
+           !producerDone.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (!audioTestRunning.load(std::memory_order_acquire)) return;
 
+    // If producer ended with no format detected (empty/error stream), exit clean.
+    if (!audioFmtReady.load(std::memory_order_acquire) &&
+        producerDone.load(std::memory_order_acquire) &&
+        cacheAvailFrames() == 0) {
+        LOG_WARN("[Sender] Producer finished without format — nothing to play");
+        return;
+    }
+
     // ---- DoP detection (needs >= 32 contiguous frames in ring) ----
-    // Spin until we have enough contiguous frames to probe
+    // Probe only if ring has enough data; escape if producer finishes before that.
     while (audioTestRunning.load(std::memory_order_acquire) &&
-           cacheContiguousFrames() < 32) {
+           cacheContiguousFrames() < 32 &&
+           !producerDone.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // Only attempt DoP probe if we actually have 32 contiguous frames.
+    // If producerDone before 32 frames, skip probe and treat as PCM.
     if (audioTestRunning.load(std::memory_order_acquire) &&
         cacheContiguousFrames() >= 32) {
         // Copy existing DoP probe logic verbatim from Phase 3 (~line 907–946)
@@ -514,24 +546,24 @@ std::thread senderThread([&]() {
         pushedFrames += frames;
     };
 
+    // Use producer-published snapshots — do NOT access decoder from this thread.
+    // snapshotSampleRate and snapshotTotalSec were written before audioFmtReady
+    // (release), and sender read audioFmtReady (acquire) above — safe to read.
+    uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+
     auto updateElapsed = [&]() {
-        auto fmt = decoder->getFormat();
-        uint32_t rate = dopDetected ? dopPcmRate : fmt.sampleRate;
-        if (rate > 0) {
-            uint64_t totalMs = pushedFrames * 1000 / rate;
-            uint32_t elapsedSec = static_cast<uint32_t>(totalMs / 1000);
-            uint32_t elapsedMs  = static_cast<uint32_t>(totalMs);
-            slimproto->updateElapsed(elapsedSec, elapsedMs);
-            if (elapsedSec >= lastElapsedLog + 10) {
-                lastElapsedLog = elapsedSec;
-                auto fmt2 = decoder->getFormat();
-                uint32_t totalSec = fmt2.totalSamples > 0
-                    ? static_cast<uint32_t>(fmt2.totalSamples / fmt2.sampleRate) : 0;
-                LOG_DEBUG("[Sender] Elapsed: " << elapsedSec << "s"
-                    << (totalSec > 0 ? " / " + std::to_string(totalSec) + "s" : "")
-                    << " (" << pushedFrames << " pushed)"
-                    << " cache=" << cacheAvailFrames() << "f");
-            }
+        if (rate == 0) return;
+        uint64_t totalMs = pushedFrames * 1000 / rate;
+        uint32_t elapsedSec = static_cast<uint32_t>(totalMs / 1000);
+        uint32_t elapsedMs  = static_cast<uint32_t>(totalMs);
+        slimproto->updateElapsed(elapsedSec, elapsedMs);
+        if (elapsedSec >= lastElapsedLog + 10) {
+            lastElapsedLog = elapsedSec;
+            LOG_DEBUG("[Sender] Elapsed: " << elapsedSec << "s"
+                << (snapshotTotalSec > 0
+                    ? " / " + std::to_string(snapshotTotalSec) + "s" : "")
+                << " (" << pushedFrames << " pushed)"
+                << " cache=" << cacheAvailFrames() << "f");
         }
     };
 
@@ -568,7 +600,7 @@ std::thread senderThread([&]() {
             sendChunk(chunk);
         }
 
-        if (decoder->isFormatReady()) {
+        if (audioFmtReady.load(std::memory_order_relaxed)) {
             updateElapsed();
         }
     }
@@ -591,7 +623,7 @@ std::thread senderThread([&]() {
             size_t chunk = std::min(contiguous, MAX_DECODE_FRAMES);
             sendChunk(chunk);
         }
-        if (decoder->isFormatReady()) updateElapsed();
+        updateElapsed();
     }
 
     LOG_DEBUG("[Sender] Done. pushedFrames=" << pushedFrames);
@@ -640,43 +672,57 @@ git commit -m "feat(audio): extract sender thread with epoch-driven wakeup from 
 
 ---
 
-## Task 7: Fix stop path — wake sender on shutdown
+## Task 7: Fix all stop paths — wake sender on shutdown
 
 **Files:**
-- Modify: `src/main.cpp` (stop handler, ~line 478)
+- Modify: `src/main.cpp` (four sites)
 
-**Step 1: Find the stop/flush path**
+There are four places where `audioTestRunning.store(false)` is set. All need
+`direttaPtr->notifySpaceAvailable()` immediately after so the sender exits via
+its predicate rather than waiting up to 2ms for the epoch timeout.
 
-Around line 473–479:
+**Step 1: Patch all four stop sites**
+
+| Line | Context |
+|---|---|
+| ~478 | STRM_START handler — stop previous stream before starting new |
+| ~1199 | STRM_STOP handler |
+| ~1222 | STRM_FLUSH handler |
+| ~1243 | `stopAudioThread` helper lambda |
+
+At each site, add `direttaPtr->notifySpaceAvailable()` after the
+`audioTestRunning.store(false)` line:
+
 ```cpp
-if (direttaPtr->isPlaying()) {
-    direttaPtr->stopPlayback(true);
-}
+// Before (at each site):
 audioTestRunning.store(false);
 httpStream->disconnect();
-```
 
-**Step 2: Add notify after clearing audioTestRunning**
-
-```cpp
+// After:
 audioTestRunning.store(false, std::memory_order_release);
 httpStream->disconnect();
-// Wake sender so it exits via predicate (!audioTestRunning) without
-// waiting up to 2ms for the epoch timeout.
-direttaPtr->notifySpaceAvailable();
+direttaPtr->notifySpaceAvailable();  // wake sender immediately
 ```
 
-**Step 3: Build**
+Note: `notifySpaceAvailable()` is safe to call even when no sender is running
+(no-op if no thread is waiting on the condition variable).
+
+**Step 2: Build**
 
 ```bash
 cd build && make -j$(nproc) 2>&1 | tail -20
 ```
 
+**Step 3: Verify prompt stop**
+
+Start playback, then immediately skip to next track. Sender should log
+`[Sender] Done` within ~1ms of stop, not after a 2ms timeout cycle.
+
 **Step 4: Commit**
 
 ```bash
 git add src/main.cpp
-git commit -m "fix(audio): wake sender thread immediately on stop via notifySpaceAvailable"
+git commit -m "fix(audio): wake sender on all stop/flush/start paths via notifySpaceAvailable"
 ```
 
 ---
