@@ -591,15 +591,18 @@ std::thread senderThread([&]() {
             break;
         }
 
-        // Block on hardware epoch signal (SDK worker pop)
+        // Block until SDK worker pops from DirettaRingBuffer (epoch signal)
+        // or a stop is requested. Do NOT add a producerDone bypass here:
+        // when the producer finishes with frames still in the SPSC ring, those
+        // frames must still wait for DirettaRingBuffer space. A bypass would
+        // make waitForSpace return immediately on every iteration while
+        // getBufferLevel() > 0.95f, turning the tail drain into a busy-spin.
         {
             std::unique_lock<std::mutex> lock(direttaPtr->getFlowMutex());
             direttaPtr->waitForSpace(lock,
                 [&]{
                     return direttaPtr->getPopEpoch() != seenEpoch
-                        || !audioTestRunning.load(std::memory_order_acquire)
-                        || (producerDone.load(std::memory_order_acquire)
-                            && cacheAvailFrames() > 0);
+                        || !audioTestRunning.load(std::memory_order_acquire);
                 },
                 std::chrono::milliseconds(2));
         }
