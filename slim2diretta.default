@@ -21,7 +21,7 @@ TARGET=1
 #   --info-cycle <us>              Info packet cycle time in us (default: 100000)
 #   --cycle-time <us>              Transfer packet cycle max time in us (default: 10000)
 #   --cycle-min-time <us>          Transfer packet cycle min time in us (random mode only)
-#   --target-profile-limit <us>    0=SelfProfile, >0=TargetProfile limit (default: 200)
+#   --target-profile-limit <us>    0=SelfProfile, >0=TargetProfile limit (default: 0)
 #   --thread-mode <bitmask>        SDK thread mode bitmask (default: 1)
 #   --mtu <bytes>                  MTU override (default: auto-detect)
 #
@@ -35,8 +35,8 @@ TARGET=1
 # Target profile (--target-profile-limit):
 #   The profile automatically adapts to your system's capabilities.
 #   If Diretta detects high load, it falls back to lighter processing.
-#   0   = SelfProfile (host-side profiling only)
-#   >0  = TargetProfile with limit in microseconds (default: 200)
+#   0   = SelfProfile (host-side profiling only, default, stable)
+#   >0  = TargetProfile with limit in microseconds (experimental)
 #
 # Thread mode (--thread-mode <bitmask>):
 #   Bitmask flags - combine by adding values together.

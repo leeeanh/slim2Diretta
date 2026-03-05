@@ -160,7 +160,7 @@
                     "type": "number",
                     "cli_arg": "--target-profile-limit",
                     "label": "Target Profile Limit (us)",
-                    "description": "0 = SelfProfile (host-side only), >0 = TargetProfile with auto-adaptation (default: 200)",
+                    "description": "0 = SelfProfile (stable, default), >0 = TargetProfile with auto-adaptation (experimental)",
                     "default": "",
                     "min": 0
                 },
