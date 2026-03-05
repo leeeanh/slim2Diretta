@@ -627,6 +627,7 @@ int main(int argc, char* argv[]) {
 
 
                         bool httpEof = false;
+                        bool stmdSent = false;  // Gapless: send STMd once on EOF
                         while (audioTestRunning.load(std::memory_order_acquire) &&
                                (!httpEof || dsdReader->availableBytes() > 0 ||
                                 !dsdReader->isFinished())) {
@@ -651,6 +652,17 @@ int main(int argc, char* argv[]) {
                                     httpEof = true;
                                     dsdReader->setEof();
                                 }
+                            }
+
+                            // === GAPLESS: send STMd as early as possible ===
+                            // Send STMd as soon as HTTP EOF is detected so LMS can
+                            // prepare the next track while we're still draining data.
+                            if (httpEof && direttaOpened && !stmdSent) {
+                                stmdSent = true;
+                                LOG_INFO("[Audio] DSD stream complete: " << totalBytes
+                                         << " bytes received, "
+                                         << pushedDsdBytes << " DSD bytes pushed");
+                                slimproto->sendStat(StatEvent::STMd);
                             }
 
                             // === PHASE 2: Format detection ===
@@ -764,14 +776,11 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // === DRAIN remaining data + gapless wait ===
-                        // Send STMd early so LMS can prepare next track while we drain
+                        // === DRAIN remaining data ===
+                        // STMd was already sent in the main loop when HTTP EOF was detected
                         dsdReader->setEof();
-                        LOG_INFO("[Audio] DSD stream complete: " << totalBytes << " bytes received, "
-                                 << pushedDsdBytes << " DSD bytes pushed");
-                        slimproto->sendStat(StatEvent::STMd);
 
-                        // Drain remaining DSD data while also waiting for pending
+                        // Drain remaining DSD data
                         while (direttaOpened &&
                                audioTestRunning.load(std::memory_order_acquire)) {
                             // Wait for DirettaSync space
@@ -926,6 +935,7 @@ int main(int argc, char* argv[]) {
                     };
 
                     bool httpEof = false;
+                    bool stmdSent = false;  // Gapless: send STMd once on EOF
                     while (audioTestRunning.load(std::memory_order_acquire) &&
                            (!httpEof || cacheFrames() > 0)) {
 
@@ -950,6 +960,24 @@ int main(int argc, char* argv[]) {
                                 httpEof = true;
                                 decoder->setEof();
                             }
+                        }
+
+                        // === GAPLESS: send STMd as early as possible ===
+                        if (httpEof && direttaOpened && !stmdSent) {
+                            stmdSent = true;
+                            if (decoder->isFormatReady()) {
+                                auto fmt = decoder->getFormat();
+                                uint64_t decoded = decoder->getDecodedSamples();
+                                uint32_t elapsedSec = fmt.sampleRate > 0
+                                    ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
+                                LOG_INFO("[Audio] Stream complete: " << totalBytes
+                                         << " bytes received, " << decoded
+                                         << " frames decoded (" << elapsedSec << "s)");
+                            } else {
+                                LOG_INFO("[Audio] Stream ended (" << totalBytes
+                                         << " bytes received)");
+                            }
+                            slimproto->sendStat(StatEvent::STMd);
                         }
 
                         // ========== PHASE 1b: Drain decoder into cache ==========
@@ -1194,23 +1222,8 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
-                    // Send STMd early — before drain — so LMS can prepare next track
-                    // while we still push remaining audio to the ring buffer
+                    // STMd was already sent in the main loop when HTTP EOF was detected
                     decoder->setEof();
-
-                    // Final elapsed time
-                    if (decoder->isFormatReady()) {
-                        auto fmt = decoder->getFormat();
-                        uint64_t decoded = decoder->getDecodedSamples();
-                        uint32_t elapsedSec = fmt.sampleRate > 0
-                            ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
-                        LOG_INFO("[Audio] Stream complete: " << totalBytes << " bytes received, "
-                                 << decoded << " frames decoded (" << elapsedSec << "s)");
-                    } else {
-                        LOG_INFO("[Audio] Stream ended (" << totalBytes << " bytes received)");
-                    }
-
-                    slimproto->sendStat(StatEvent::STMd);  // Decoder finished
 
                     // Drain: decoder may have remaining frames after HTTP EOF
                     while (!decoder->isFinished() && !decoder->hasError() &&
