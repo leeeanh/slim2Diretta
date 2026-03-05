@@ -2,9 +2,19 @@
 
 All notable changes to slim2diretta are documented in this file.
 
-## v1.1.0 (2026-03-03)
+## v1.1.0 (2026-03-05)
 
 ### Added
+
+- **Gapless playback**: Seamless track transitions without audio gaps
+  - PCM/FLAC: gapless chaining with format change detection
+  - DSD (DSF/DFF): gapless chaining with automatic format negotiation
+  - Audio thread stays alive between tracks — no Diretta reconnection needed
+
+- **Seek support**: In-track seeking via LMS progress bar
+  - FLAC: seek to any position (format detection from frame header when STREAMINFO absent)
+  - DSD: seek to any position
+  - Correct thread lifecycle management (seek vs gapless path detection)
 
 - **Web Configuration UI (diretta-webui)**: Browser-based settings interface
   - Accessible at `http://<ip>:8081` — no SSH needed to configure slim2diretta
@@ -18,6 +28,8 @@ All notable changes to slim2diretta are documented in this file.
 
 ### Fixed
 
+- **DSF padding silence**: Replace zero-padding in last DSF block with DSD silence (0x69) to eliminate click at track transitions
+- **FLAC seek without header**: Fallback format detection from FLAC frame header when LMS sends seek streams without STREAMINFO metadata
 - **Config parser**: Handle missing `/etc/default/slim2diretta` file (create on first save instead of crash)
 - **Config parser**: Skip duplicate uncommented `SLIM2DIRETTA_OPTS=` lines on save
 

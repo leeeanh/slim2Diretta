@@ -141,6 +141,10 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 - **Dynamic conversion**: Planar, bit-reverse, byte-swap as needed by DAC
 - **All rates**: DSD64 (2.8MHz) to DSD1024 (45.2MHz)
 
+### Playback Features
+- **Gapless playback**: Seamless track transitions for PCM/FLAC and DSD (DSF/DFF)
+- **Seek support**: In-track seeking via LMS progress bar (FLAC, DSD)
+
 ### Low-Latency Architecture
 - **DirettaSync v2.0**: Shared with squeeze2diretta and DirettaRendererUPnP
 - **Lock-free ring buffers**: SPSC design with SIMD optimizations (AVX2/NEON)
@@ -214,7 +218,7 @@ git pull
 sudo systemctl start slim2diretta@1
 ```
 
-> **What's new in v1.1.0:** Web Configuration UI — configure slim2diretta from your browser at `http://<ip>:8081` instead of editing `/etc/default/slim2diretta` manually. See [Web Configuration UI](#web-configuration-ui) for details.
+> **What's new in v1.1.0:** Gapless playback (FLAC + DSD), seek support, and Web Configuration UI — configure slim2diretta from your browser at `http://<ip>:8081` instead of editing `/etc/default/slim2diretta` manually. See [Web Configuration UI](#web-configuration-ui) for details.
 
 ---
 
@@ -723,4 +727,4 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 **Enjoy native DSD and hi-res PCM streaming from your LMS library!**
 
-*Last updated: 2026-03-03 (v1.1.0)*
+*Last updated: 2026-03-05 (v1.1.0)*
