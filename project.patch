@@ -1,0 +1,785 @@
+diff --git a/diretta/DirettaSync.cpp b/diretta/DirettaSync.cpp
+index 7107d1b..4763c30 100644
+--- a/diretta/DirettaSync.cpp
++++ b/diretta/DirettaSync.cpp
+@@ -1726,6 +1726,10 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
+     // Pop from ring buffer
+     m_ringBuffer.pop(dest, currentBytesPerBuffer);
+ 
++    // Epoch incremented unconditionally before try_lock — allows sender to
++    // detect pops even when it holds the mutex (avoiding lost wakeups)
++    m_popEpoch.fetch_add(1, std::memory_order_release);
++
+     // G1: Signal producer that space is now available
+     // Use try_lock to avoid blocking the time-critical consumer thread
+     // If producer isn't waiting, this is a no-op (harmless notification)
+diff --git a/diretta/DirettaSync.h b/diretta/DirettaSync.h
+index 32c85b9..e07b0ba 100644
+--- a/diretta/DirettaSync.h
++++ b/diretta/DirettaSync.h
+@@ -454,6 +454,32 @@ public:
+         m_spaceAvailable.notify_one();
+     }
+ 
++    /**
++     * @brief Wait for buffer space with a stop predicate.
++     * Wakes when predicate returns true OR timeout expires.
++     * Use this to avoid sleeping past a stop/flush signal.
++     *
++     * @param pred  Callable returning bool; checked on each wakeup.
++     *              Returns true = stop waiting immediately.
++     */
++    template<typename Rep, typename Period, typename Pred>
++    bool waitForSpace(std::unique_lock<std::mutex>& lock,
++                      Pred pred,
++                      std::chrono::duration<Rep, Period> timeout) {
++        return m_spaceAvailable.wait_for(lock, timeout, pred);
++    }
++
++    /**
++     * @brief Epoch counter incremented on each SDK worker pop.
++     * Allows sender thread to detect pops without relying solely on
++     * try_lock + notify_one (which can miss when sender holds the mutex).
++     */
++    alignas(64) std::atomic<uint64_t> m_popEpoch{0};
++
++    uint64_t getPopEpoch() const {
++        return m_popEpoch.load(std::memory_order_acquire);
++    }
++
+     //=========================================================================
+     // Target Management
+     //=========================================================================
+diff --git a/src/main.cpp b/src/main.cpp
+index f34162e..83b1305 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -475,8 +475,9 @@ int main(int argc, char* argv[]) {
+                 }
+ 
+                 // Stop any previous audio thread
+-                audioTestRunning.store(false);
++                audioTestRunning.store(false, std::memory_order_release);
+                 httpStream->disconnect();
++                direttaPtr->notifySpaceAvailable();
+                 if (audioTestThread.joinable()) {
+                     // Wait up to 500ms for the thread to finish
+                     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+@@ -771,18 +772,20 @@ int main(int argc, char* argv[]) {
+                     bool formatLogged = false;
+                     uint64_t lastElapsedLog = 0;
+ 
+-                    // Decode cache: decouples HTTP reading from DirettaSync pushing.
+-                    // When DirettaSync buffer is full (flow control), we still read
+-                    // HTTP and decode into this cache. This prevents TCP starvation
+-                    // that caused underruns with bursty Qobuz streams.
++                    // Decode cache: fixed-size circular buffer to decouple
++                    // HTTP/decoder production from DirettaSync consumption.
+                     // Max ~1s at 1536kHz stereo = 3072K samples
+                     constexpr size_t DECODE_CACHE_MAX_SAMPLES = 3072000;
+-                    std::vector<int32_t> decodeCache;
+-                    size_t decodeCachePos = 0;  // Read position (samples consumed)
++                    std::vector<int32_t> decodeCache(DECODE_CACHE_MAX_SAMPLES);
++
++                    // SPSC ring: sample-unit monotonic counters.
++                    alignas(64) std::atomic<size_t> writeSeq{0};  // producer publishes
++                    alignas(64) std::atomic<size_t> readSeq{0};   // sender publishes
++                    size_t w = 0;  // producer-local sample counter
++                    size_t r = 0;  // sender-local sample counter
+ 
+                     constexpr unsigned int PREBUFFER_MS = 500;
+                     uint64_t pushedFrames = 0;  // Frames actually sent to DirettaSync
+-                    bool direttaOpened = false;
+                     AudioFormat audioFmt{};
+                     int detectedChannels = 2;
+ 
+@@ -791,338 +794,366 @@ int main(int argc, char* argv[]) {
+                     uint32_t dopPcmRate = 0;  // Original PCM carrier rate for elapsed
+                     std::vector<uint8_t> dopBuf;  // Conversion buffer (allocated if DoP)
+ 
+-                    // Helper: available frames in decode cache
+-                    auto cacheFrames = [&]() -> size_t {
+-                        return (decodeCache.size() - decodeCachePos) /
+-                               std::max(detectedChannels, 1);
++                    // --- Shared state: producer writes once, sender reads after flag ---
++                    std::atomic<bool> audioFmtReady{false};
++                    std::atomic<bool> prebufferReady{false};
++                    std::atomic<bool> producerDone{false};
++                    std::atomic<bool> senderOpenedDiretta{false};
++                    std::atomic<bool> naturalStreamEnd{false};
++                    std::atomic<bool> streamError{false};
++
++                    // Snapshots published by producer before audioFmtReady.
++                    uint32_t snapshotSampleRate = 0;
++                    uint32_t snapshotTotalSec = 0;
++
++                    // --- Producer-side helpers (use local w, read readSeq) ---
++                    auto cacheFreeFrames = [&]() -> size_t {
++                        int ch = std::max(detectedChannels, 1);
++                        size_t rSnap = readSeq.load(std::memory_order_acquire);
++                        return (DECODE_CACHE_MAX_SAMPLES - (w - rSnap))
++                            / static_cast<size_t>(ch);
++                    };
++                    auto cachePushFrames = [&](const int32_t* src, size_t frames) -> size_t {
++                        int ch = std::max(detectedChannels, 1);
++                        size_t samples = frames * static_cast<size_t>(ch);
++                        size_t rSnap = readSeq.load(std::memory_order_acquire);
++                        size_t free = DECODE_CACHE_MAX_SAMPLES - (w - rSnap);
++                        size_t toWrite = std::min(samples, free);
++                        if (toWrite == 0) return 0;
++
++                        size_t pos = w % DECODE_CACHE_MAX_SAMPLES;
++                        size_t toEnd = DECODE_CACHE_MAX_SAMPLES - pos;
++                        size_t first = std::min(toWrite, toEnd);
++                        std::memcpy(decodeCache.data() + pos, src, first * sizeof(int32_t));
++                        if (toWrite > first) {
++                            std::memcpy(decodeCache.data(), src + first,
++                                        (toWrite - first) * sizeof(int32_t));
++                        }
++                        writeSeq.store(w += toWrite, std::memory_order_release);
++                        return toWrite / static_cast<size_t>(ch);
++                    };
++                    auto cacheBufferedFrames = [&]() -> size_t {
++                        int ch = std::max(detectedChannels, 1);
++                        size_t rSnap = readSeq.load(std::memory_order_acquire);
++                        return (w - rSnap) / static_cast<size_t>(ch);
+                     };
+ 
+-                    bool httpEof = false;
+-                    while (audioTestRunning.load(std::memory_order_acquire) &&
+-                           (!httpEof || cacheFrames() > 0)) {
+-
+-                        // ========== PHASE 1a: HTTP read ==========
+-                        // Read HTTP data and feed to decoder when cache has space.
+-                        bool gotData = false;
+-                        size_t cacheSamples = decodeCache.size() - decodeCachePos;
+-                        if (cacheSamples < DECODE_CACHE_MAX_SAMPLES && !httpEof) {
+-                            if (httpStream->isConnected()) {
+-                                ssize_t n = httpStream->readWithTimeout(
+-                                    httpBuf, sizeof(httpBuf), 2);
+-                                if (n > 0) {
+-                                    gotData = true;
+-                                    totalBytes += n;
+-                                    slimproto->updateStreamBytes(totalBytes);
+-                                    decoder->feed(httpBuf, static_cast<size_t>(n));
+-                                } else if (n < 0 || !httpStream->isConnected()) {
+-                                    httpEof = true;
++                    // --- Sender-side helpers (use local r, read writeSeq) ---
++                    auto cacheAvailFrames = [&]() -> size_t {
++                        int ch = std::max(detectedChannels, 1);
++                        return (writeSeq.load(std::memory_order_acquire) - r)
++                            / static_cast<size_t>(ch);
++                    };
++                    auto cacheContiguousFrames = [&]() -> size_t {
++                        int ch = std::max(detectedChannels, 1);
++                        size_t pos = r % DECODE_CACHE_MAX_SAMPLES;
++                        size_t toEnd = (DECODE_CACHE_MAX_SAMPLES - pos) / static_cast<size_t>(ch);
++                        return std::min(cacheAvailFrames(), toEnd);
++                    };
++                    auto cacheReadPtr = [&]() -> const int32_t* {
++                        return decodeCache.data() + (r % DECODE_CACHE_MAX_SAMPLES);
++                    };
++                    auto cachePopFrames = [&](size_t frames) {
++                        int ch = std::max(detectedChannels, 1);
++                        readSeq.store(r += frames * static_cast<size_t>(ch),
++                                      std::memory_order_release);
++                    };
++
++                    std::thread producerThread([&]() {
++                        bool producerEof = false;
++                        while (audioTestRunning.load(std::memory_order_acquire) && !producerEof) {
++                            // ---- Phase 1a: HTTP read ----
++                            bool gotData = false;
++                            if (cacheFreeFrames() > 0) {
++                                if (httpStream->isConnected()) {
++                                    ssize_t n = httpStream->readWithTimeout(httpBuf, sizeof(httpBuf), 2);
++                                    if (n > 0) {
++                                        gotData = true;
++                                        totalBytes += static_cast<uint64_t>(n);
++                                        slimproto->updateStreamBytes(totalBytes);
++                                        decoder->feed(httpBuf, static_cast<size_t>(n));
++                                    } else if (n < 0 || !httpStream->isConnected()) {
++                                        producerEof = true;
++                                        decoder->setEof();
++                                    }
++                                } else {
++                                    producerEof = true;
+                                     decoder->setEof();
+                                 }
+-                            } else {
+-                                httpEof = true;
+-                                decoder->setEof();
+                             }
+-                        }
+ 
+-                        // ========== PHASE 1b: Drain decoder into cache ==========
+-                        // Always drain, even after httpEof — decoder may have
+-                        // buffered data from previous feed() calls.
+-                        if (decodeCache.size() - decodeCachePos <
+-                            DECODE_CACHE_MAX_SAMPLES) {
++                            // ---- Phase 1b: Drain decoder -> SPSC ring ----
+                             while (true) {
+-                                size_t frames = decoder->readDecoded(
+-                                    decodeBuf, MAX_DECODE_FRAMES);
++                                size_t free = cacheFreeFrames();
++                                if (free == 0) break;
++                                size_t maxFrames = std::min(MAX_DECODE_FRAMES, free);
++                                size_t frames = decoder->readDecoded(decodeBuf, maxFrames);
+                                 if (frames == 0) break;
+-                                decodeCache.insert(decodeCache.end(), decodeBuf,
+-                                    decodeBuf + frames * detectedChannels);
++                                size_t written = cachePushFrames(decodeBuf, frames);
++                                if (written != frames) {
++                                    LOG_WARN("[Producer] Cache full while draining decoder");
++                                    break;
++                                }
+                             }
+-                        }
+ 
+-                        // ========== PHASE 2: Format detection ==========
+-                        if (!formatLogged && decoder->isFormatReady()) {
+-                            formatLogged = true;
+-                            auto fmt = decoder->getFormat();
+-                            LOG_INFO("[Audio] Decoding: " << fmt.sampleRate << " Hz, "
+-                                     << fmt.bitDepth << "-bit, " << fmt.channels << " ch");
+-                            detectedChannels = fmt.channels;
+-                            audioFmt.sampleRate = fmt.sampleRate;
+-                            audioFmt.bitDepth = 32;
+-                            audioFmt.channels = fmt.channels;
+-                            audioFmt.isCompressed = (formatCode == FORMAT_FLAC ||
+-                                                     formatCode == FORMAT_MP3 ||
+-                                                     formatCode == FORMAT_OGG ||
+-                                                     formatCode == FORMAT_AAC);
+-                        }
++                            // ---- Phase 2: Format detection (one-shot) ----
++                            if (!formatLogged && decoder->isFormatReady()) {
++                                formatLogged = true;
++                                auto fmt = decoder->getFormat();
++                                LOG_INFO("[Audio] Decoding: " << fmt.sampleRate << " Hz, "
++                                         << fmt.bitDepth << "-bit, " << fmt.channels << " ch");
++                                detectedChannels = fmt.channels;
++                                audioFmt.sampleRate = fmt.sampleRate;
++                                audioFmt.bitDepth = 32;
++                                audioFmt.channels = fmt.channels;
++                                audioFmt.isCompressed = (formatCode == FORMAT_FLAC ||
++                                                         formatCode == FORMAT_MP3 ||
++                                                         formatCode == FORMAT_OGG ||
++                                                         formatCode == FORMAT_AAC);
++                                snapshotSampleRate = fmt.sampleRate;
++                                snapshotTotalSec = (fmt.totalSamples > 0 && fmt.sampleRate > 0)
++                                    ? static_cast<uint32_t>(fmt.totalSamples / fmt.sampleRate)
++                                    : 0;
++                                audioFmtReady.store(true, std::memory_order_release);
++                            }
+ 
+-                        // ========== PHASE 3: Prebuffer phase ==========
+-                        if (formatLogged && !direttaOpened) {
+-                            auto fmt = decoder->getFormat();
+-                            size_t targetFrames = static_cast<size_t>(
+-                                fmt.sampleRate) * PREBUFFER_MS / 1000;
+-                            if (cacheFrames() >= targetFrames || httpEof) {
+-                                size_t prebufFrames = cacheFrames();
+-                                if (prebufFrames == 0) continue;
+-
+-                                // Detect DoP (DSD over PCM) — Roon sends
+-                                // DSD as DoP with format code 'p'
+-                                if (!dopDetected && cacheFrames() >= 32) {
+-                                    const int32_t* samples =
+-                                        decodeCache.data() + decodeCachePos;
+-                                    // Debug: dump first 8 marker bytes
+-                                    {
+-                                        std::ostringstream oss;
+-                                        oss << "[Audio] DoP probe markers:";
+-                                        size_t n = std::min(cacheFrames(),
+-                                                            size_t(8));
+-                                        for (size_t k = 0; k < n; k++) {
+-                                            uint8_t m = static_cast<uint8_t>(
+-                                                (samples[k * detectedChannels]
+-                                                 >> 24) & 0xFF);
+-                                            oss << " 0x" << std::hex
+-                                                << std::setfill('0')
+-                                                << std::setw(2)
+-                                                << static_cast<int>(m);
+-                                        }
+-                                        oss << std::dec;
+-                                        LOG_DEBUG(oss.str());
+-                                    }
+-                                    if (detectDoP(samples, cacheFrames(),
+-                                                  detectedChannels)) {
+-                                        dopDetected = true;
+-                                        dopPcmRate = audioFmt.sampleRate;
+-                                        uint32_t dsdRate =
+-                                            DsdProcessor::calculateDsdRate(
+-                                                dopPcmRate, true);
+-                                        audioFmt.isDSD = true;
+-                                        audioFmt.sampleRate = dsdRate;
+-                                        audioFmt.dsdFormat =
+-                                            AudioFormat::DSDFormat::DFF;
+-                                        dopBuf.resize(MAX_DECODE_FRAMES * 2
+-                                                      * detectedChannels);
+-                                        LOG_INFO("[Audio] DoP detected — "
+-                                            << DsdProcessor::rateName(dsdRate)
+-                                            << " (" << dsdRate << " Hz), "
+-                                            << detectedChannels << " ch, "
+-                                            << "carrier " << dopPcmRate
+-                                            << " Hz");
+-                                    }
++                            // ---- Prebuffer threshold ----
++                            if (audioFmtReady.load(std::memory_order_relaxed) &&
++                                !prebufferReady.load(std::memory_order_relaxed)) {
++                                size_t targetFrames =
++                                    static_cast<size_t>(snapshotSampleRate) * PREBUFFER_MS / 1000;
++                                if (cacheBufferedFrames() >= targetFrames || producerEof) {
++                                    prebufferReady.store(true, std::memory_order_release);
+                                 }
++                            }
+ 
+-                                if (!direttaPtr->open(audioFmt)) {
+-                                    LOG_ERROR("[Audio] Failed to open Diretta output");
+-                                    slimproto->sendStat(StatEvent::STMn);
+-                                    audioThreadDone.store(true, std::memory_order_release);
+-                                    return;
+-                                }
+-                                if (!dopDetected) {
+-                                    // Set S24 pack mode hint AFTER open() — open()
+-                                    // calls clear() which resets the hint. Our decoders
+-                                    // always output MSB-aligned int32_t samples.
+-                                    // Not needed for DoP (DSD mode uses byte push).
+-                                    direttaPtr->setS24PackModeHint(
+-                                        DirettaRingBuffer::S24PackMode::MsbAligned);
+-                                }
++                            if (!gotData && !producerEof) {
++                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                            }
+ 
+-                                uint32_t prebufMs = static_cast<uint32_t>(
+-                                    prebufFrames * 1000 / (dopDetected
+-                                        ? dopPcmRate : fmt.sampleRate));
+-                                LOG_INFO("[Audio] Pre-buffered " << prebufFrames
+-                                         << " frames (" << prebufMs << "ms)");
+-
+-                                // Flush prebuffer — stop when ring buffer is full
+-                                const int32_t* ptr = decodeCache.data() + decodeCachePos;
+-                                size_t remaining = prebufFrames;
+-                                size_t actualPushed = 0;
+-                                while (remaining > 0 &&
+-                                       audioTestRunning.load(std::memory_order_relaxed)) {
+-                                    if (direttaPtr->getBufferLevel() > 0.95f) break;
+-                                    size_t chunk = std::min(remaining, MAX_DECODE_FRAMES);
+-                                    if (dopDetected) {
+-                                        // Convert DoP → native DSD planar
+-                                        DsdProcessor::convertDopToNative(
+-                                            reinterpret_cast<const uint8_t*>(ptr),
+-                                            dopBuf.data(), chunk,
+-                                            detectedChannels);
+-                                        size_t dsdBytes = chunk * 2
+-                                                          * detectedChannels;
+-                                        size_t numDsdSamples =
+-                                            dsdBytes * 8 / detectedChannels;
+-                                        direttaPtr->sendAudio(
+-                                            dopBuf.data(), numDsdSamples);
+-                                    } else {
+-                                        direttaPtr->sendAudio(
+-                                            reinterpret_cast<const uint8_t*>(ptr),
+-                                            chunk);
+-                                    }
+-                                    ptr += chunk * detectedChannels;
+-                                    remaining -= chunk;
+-                                    actualPushed += chunk;
+-                                }
+-                                decodeCachePos += actualPushed * detectedChannels;
+-                                pushedFrames += actualPushed;
+-                                direttaOpened = true;
+-                                slimproto->sendStat(StatEvent::STMl);
++                            if (decoder->hasError()) {
++                                LOG_ERROR("[Producer] Decoder error");
++                                streamError.store(true, std::memory_order_release);
++                                break;
+                             }
+-                            continue;  // Stay in prebuffer mode
+                         }
+ 
+-                        // ========== PHASE 4: Push from cache to DirettaSync ==========
+-                        if (direttaOpened && cacheFrames() > 0) {
+-                            if (direttaPtr->isPaused()) {
+-                                std::this_thread::sleep_for(
+-                                    std::chrono::milliseconds(100));
+-                            } else if (direttaPtr->getBufferLevel() <= 0.95f) {
+-                                // Buffer has space - push one chunk
+-                                size_t push = std::min(cacheFrames(), MAX_DECODE_FRAMES);
+-                                if (dopDetected) {
+-                                    DsdProcessor::convertDopToNative(
+-                                        reinterpret_cast<const uint8_t*>(
+-                                            decodeCache.data() + decodeCachePos),
+-                                        dopBuf.data(), push,
+-                                        detectedChannels);
+-                                    size_t dsdBytes = push * 2
+-                                                      * detectedChannels;
+-                                    size_t numDsdSamples =
+-                                        dsdBytes * 8 / detectedChannels;
+-                                    direttaPtr->sendAudio(
+-                                        dopBuf.data(), numDsdSamples);
+-                                } else {
+-                                    direttaPtr->sendAudio(
+-                                        reinterpret_cast<const uint8_t*>(
+-                                            decodeCache.data() + decodeCachePos),
+-                                        push);
+-                                }
+-                                decodeCachePos += push * detectedChannels;
+-                                pushedFrames += push;
+-                            } else {
+-                                // Buffer full - sleep briefly, then loop back
+-                                // to read more HTTP (keeps TCP pipeline flowing)
+-                                std::this_thread::sleep_for(
+-                                    std::chrono::milliseconds(1));
++                        // Post-EOF decoder drain.
++                        decoder->setEof();
++                        while (!decoder->isFinished() && !decoder->hasError() &&
++                               audioTestRunning.load(std::memory_order_acquire)) {
++                            size_t free = cacheFreeFrames();
++                            if (free == 0) {
++                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                                continue;
+                             }
++                            size_t frames = decoder->readDecoded(
++                                decodeBuf, std::min(MAX_DECODE_FRAMES, free));
++                            if (frames == 0) break;
++                            cachePushFrames(decodeBuf, frames);
+                         }
+ 
+-                        // ========== PHASE 5: Update elapsed time ==========
+-                        if (direttaOpened && decoder->isFormatReady()) {
+-                            auto fmt = decoder->getFormat();
+-                            uint32_t elapsedRate = dopDetected
+-                                ? dopPcmRate : fmt.sampleRate;
+-                            if (elapsedRate > 0) {
+-                                uint64_t totalMs = pushedFrames * 1000 / elapsedRate;
+-                                uint32_t elapsedSec = static_cast<uint32_t>(totalMs / 1000);
+-                                uint32_t elapsedMs = static_cast<uint32_t>(totalMs);
+-                                slimproto->updateElapsed(elapsedSec, elapsedMs);
++                        if (!prebufferReady.load(std::memory_order_relaxed)) {
++                            prebufferReady.store(true, std::memory_order_release);
++                        }
+ 
+-                                if (elapsedSec >= lastElapsedLog + 10) {
+-                                    lastElapsedLog = elapsedSec;
+-                                    uint32_t totalSec = fmt.totalSamples > 0
+-                                        ? static_cast<uint32_t>(
+-                                            fmt.totalSamples / fmt.sampleRate) : 0;
+-                                    LOG_DEBUG("[Audio] Elapsed: " << elapsedSec << "s"
+-                                        << (totalSec > 0
+-                                            ? " / " + std::to_string(totalSec) + "s" : "")
+-                                        << " (" << pushedFrames << " pushed)"
+-                                        << " cache=" << cacheFrames() << "f");
+-                                }
+-                            }
++                        producerDone.store(true, std::memory_order_release);
++                        LOG_DEBUG("[Producer] Done. totalBytes=" << totalBytes);
++                    });
++
++                    std::thread senderThread([&]() {
++                        while (audioTestRunning.load(std::memory_order_acquire) &&
++                               !prebufferReady.load(std::memory_order_acquire) &&
++                               !producerDone.load(std::memory_order_acquire)) {
++                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                         }
++                        if (!audioTestRunning.load(std::memory_order_acquire)) return;
+ 
+-                        // ========== PHASE 6: Compact cache ==========
+-                        // Periodically remove consumed samples to prevent
+-                        // unbounded growth of the vector
+-                        if (decodeCachePos > 100000) {
+-                            decodeCache.erase(decodeCache.begin(),
+-                                decodeCache.begin() + decodeCachePos);
+-                            decodeCachePos = 0;
++                        if (!audioFmtReady.load(std::memory_order_acquire)) {
++                            LOG_WARN("[Sender] No valid format detected - cannot open Diretta");
++                            streamError.store(true, std::memory_order_release);
++                            return;
+                         }
+ 
+-                        // ========== PHASE 7: Anti-busy-loop ==========
+-                        if (!gotData && cacheFrames() == 0 && !httpEof) {
++                        // DoP detection (requires >= 32 contiguous frames).
++                        while (audioTestRunning.load(std::memory_order_acquire) &&
++                               cacheContiguousFrames() < 32 &&
++                               !producerDone.load(std::memory_order_acquire)) {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                         }
+-
+-                        if (decoder->hasError()) {
+-                            LOG_ERROR("[Audio] Decoder error");
+-                            break;
++                        if (audioTestRunning.load(std::memory_order_acquire) &&
++                            cacheContiguousFrames() >= 32) {
++                            const int32_t* samples = cacheReadPtr();
++                            {
++                                std::ostringstream oss;
++                                oss << "[Audio] DoP probe markers:";
++                                size_t n = std::min(cacheContiguousFrames(), size_t(8));
++                                for (size_t k = 0; k < n; k++) {
++                                    uint8_t m = static_cast<uint8_t>(
++                                        (samples[k * detectedChannels] >> 24) & 0xFF);
++                                    oss << " 0x" << std::hex
++                                        << std::setfill('0')
++                                        << std::setw(2)
++                                        << static_cast<int>(m);
++                                }
++                                oss << std::dec;
++                                LOG_DEBUG(oss.str());
++                            }
++                            if (detectDoP(samples, cacheContiguousFrames(), detectedChannels)) {
++                                dopDetected = true;
++                                dopPcmRate = audioFmt.sampleRate;
++                                uint32_t dsdRate = DsdProcessor::calculateDsdRate(dopPcmRate, true);
++                                audioFmt.isDSD = true;
++                                audioFmt.sampleRate = dsdRate;
++                                audioFmt.dsdFormat = AudioFormat::DSDFormat::DFF;
++                                dopBuf.resize(MAX_DECODE_FRAMES * 2 * detectedChannels);
++                                LOG_INFO("[Audio] DoP detected - "
++                                    << DsdProcessor::rateName(dsdRate)
++                                    << " (" << dsdRate << " Hz), "
++                                    << detectedChannels << " ch, carrier "
++                                    << dopPcmRate << " Hz");
++                            }
+                         }
+-                    }
+ 
+-                    // Drain: decoder may have remaining frames after HTTP EOF
+-                    decoder->setEof();
+-                    while (!decoder->isFinished() && !decoder->hasError() &&
+-                           audioTestRunning.load(std::memory_order_acquire)) {
+-                        size_t frames = decoder->readDecoded(decodeBuf, MAX_DECODE_FRAMES);
+-                        if (frames == 0) break;
+-                        decodeCache.insert(decodeCache.end(), decodeBuf,
+-                            decodeBuf + frames * detectedChannels);
+-                    }
++                        // Open Diretta
++                        size_t prebufFrames = cacheAvailFrames();
++                        uint32_t prebufMs = static_cast<uint32_t>(
++                            prebufFrames * 1000 /
++                            (dopDetected ? dopPcmRate : audioFmt.sampleRate));
++                        LOG_INFO("[Sender] Pre-buffered " << prebufFrames
++                                 << " frames (" << prebufMs << "ms)");
++
++                        if (!direttaPtr->open(audioFmt)) {
++                            LOG_ERROR("[Sender] Failed to open Diretta output");
++                            slimproto->sendStat(StatEvent::STMn);
++                            audioTestRunning.store(false, std::memory_order_release);
++                            direttaPtr->notifySpaceAvailable();
++                            return;
++                        }
++                        if (!dopDetected) {
++                            direttaPtr->setS24PackModeHint(
++                                DirettaRingBuffer::S24PackMode::MsbAligned);
++                        }
++                        senderOpenedDiretta.store(true, std::memory_order_release);
++                        bool direttaOpened = true;
++                        slimproto->sendStat(StatEvent::STMl);
++
++                        uint64_t seenEpoch = direttaPtr->getPopEpoch();
++
++                        auto sendChunk = [&](size_t frames) {
++                            const int32_t* ptr = cacheReadPtr();
++                            if (dopDetected) {
++                                DsdProcessor::convertDopToNative(
++                                    reinterpret_cast<const uint8_t*>(ptr),
++                                    dopBuf.data(), frames, detectedChannels);
++                                size_t dsdBytes = frames * 2 * detectedChannels;
++                                size_t numDsdSamples = dsdBytes * 8 / detectedChannels;
++                                direttaPtr->sendAudio(dopBuf.data(), numDsdSamples);
++                            } else {
++                                direttaPtr->sendAudio(
++                                    reinterpret_cast<const uint8_t*>(ptr), frames);
++                            }
++                            cachePopFrames(frames);
++                            pushedFrames += frames;
++                        };
++
++                        uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
++
++                        auto updateElapsed = [&]() {
++                            if (rate == 0) return;
++                            uint64_t totalMs = pushedFrames * 1000 / rate;
++                            uint32_t elapsedSec = static_cast<uint32_t>(totalMs / 1000);
++                            uint32_t elapsedMs = static_cast<uint32_t>(totalMs);
++                            slimproto->updateElapsed(elapsedSec, elapsedMs);
++                            if (elapsedSec >= lastElapsedLog + 10) {
++                                lastElapsedLog = elapsedSec;
++                                LOG_DEBUG("[Sender] Elapsed: " << elapsedSec << "s"
++                                    << (snapshotTotalSec > 0
++                                        ? " / " + std::to_string(snapshotTotalSec) + "s" : "")
++                                    << " (" << pushedFrames << " pushed)"
++                                    << " cache=" << cacheAvailFrames() << "f");
++                            }
++                        };
+ 
+-                    // Push remaining cache to DirettaSync
+-                    while (direttaOpened && cacheFrames() > 0 &&
+-                           audioTestRunning.load(std::memory_order_acquire)) {
+                         while (audioTestRunning.load(std::memory_order_acquire)) {
+-                            if (direttaPtr->isPaused()) {
+-                                std::this_thread::sleep_for(
+-                                    std::chrono::milliseconds(100));
+-                                continue;
++                            if (producerDone.load(std::memory_order_acquire) &&
++                                cacheAvailFrames() == 0) {
++                                naturalStreamEnd.store(true, std::memory_order_release);
++                                break;
+                             }
+-                            if (direttaPtr->getBufferLevel() > 0.95f) {
+-                                std::unique_lock<std::mutex> lock(
+-                                    direttaPtr->getFlowMutex());
++
++                            {
++                                std::unique_lock<std::mutex> lock(direttaPtr->getFlowMutex());
+                                 direttaPtr->waitForSpace(lock,
+-                                    std::chrono::milliseconds(5));
++                                    [&]() {
++                                        return direttaPtr->getPopEpoch() != seenEpoch ||
++                                               !audioTestRunning.load(std::memory_order_acquire);
++                                    },
++                                    std::chrono::milliseconds(2));
++                            }
++                            seenEpoch = direttaPtr->getPopEpoch();
++
++                            if (direttaPtr->isPaused()) {
++                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                 continue;
+                             }
+-                            break;
++
++                            while (audioTestRunning.load(std::memory_order_relaxed) &&
++                                   direttaPtr->getBufferLevel() <= 0.95f) {
++                                size_t contiguous = cacheContiguousFrames();
++                                if (contiguous == 0) break;
++                                size_t chunk = std::min(contiguous, MAX_DECODE_FRAMES);
++                                sendChunk(chunk);
++                            }
++
++                            if (audioFmtReady.load(std::memory_order_relaxed)) {
++                                updateElapsed();
++                            }
+                         }
+-                        size_t push = std::min(cacheFrames(), MAX_DECODE_FRAMES);
+-                        if (dopDetected) {
+-                            DsdProcessor::convertDopToNative(
+-                                reinterpret_cast<const uint8_t*>(
+-                                    decodeCache.data() + decodeCachePos),
+-                                dopBuf.data(), push, detectedChannels);
+-                            size_t dsdBytes = push * 2 * detectedChannels;
+-                            size_t numDsdSamples =
+-                                dsdBytes * 8 / detectedChannels;
+-                            direttaPtr->sendAudio(
+-                                dopBuf.data(), numDsdSamples);
+-                        } else {
+-                            direttaPtr->sendAudio(
+-                                reinterpret_cast<const uint8_t*>(
+-                                    decodeCache.data() + decodeCachePos),
+-                                push);
++
++                        if (direttaOpened) {
++                            while (cacheAvailFrames() > 0 &&
++                                   audioTestRunning.load(std::memory_order_acquire)) {
++                                if (direttaPtr->isPaused()) {
++                                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++                                    continue;
++                                }
++                                if (direttaPtr->getBufferLevel() > 0.95f) {
++                                    std::unique_lock<std::mutex> lock(direttaPtr->getFlowMutex());
++                                    direttaPtr->waitForSpace(lock, std::chrono::milliseconds(5));
++                                    continue;
++                                }
++                                size_t contiguous = cacheContiguousFrames();
++                                if (contiguous == 0) break;
++                                size_t chunk = std::min(contiguous, MAX_DECODE_FRAMES);
++                                sendChunk(chunk);
++                            }
++                            updateElapsed();
+                         }
+-                        decodeCachePos += push * detectedChannels;
+-                        pushedFrames += push;
+ 
+-                        // Update elapsed during drain
++                        LOG_DEBUG("[Sender] Done. pushedFrames=" << pushedFrames);
++                    });
++
++                    producerThread.join();
++                    senderThread.join();
++
++                    if (streamError.load(std::memory_order_acquire)) {
++                        slimproto->sendStat(StatEvent::STMn);
++                    } else if (senderOpenedDiretta.load(std::memory_order_acquire) &&
++                               naturalStreamEnd.load(std::memory_order_acquire)) {
+                         if (decoder->isFormatReady()) {
+                             auto fmt = decoder->getFormat();
+-                            uint32_t elapsedRate = dopDetected
+-                                ? dopPcmRate : fmt.sampleRate;
+-                            if (elapsedRate > 0) {
+-                                uint64_t totalMs = pushedFrames * 1000 / elapsedRate;
+-                                uint32_t elapsedSec = static_cast<uint32_t>(totalMs / 1000);
+-                                uint32_t elapsedMs = static_cast<uint32_t>(totalMs);
+-                                slimproto->updateElapsed(elapsedSec, elapsedMs);
+-                            }
++                            uint64_t decoded = decoder->getDecodedSamples();
++                            uint32_t elapsedSec = fmt.sampleRate > 0
++                                ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
++                            LOG_INFO("[Audio] Stream complete: " << totalBytes << " bytes, "
++                                     << decoded << " frames decoded (" << elapsedSec << "s)");
++                        } else {
++                            LOG_INFO("[Audio] Stream ended (" << totalBytes << " bytes received)");
+                         }
++                        slimproto->sendStat(StatEvent::STMd);
++                        slimproto->sendStat(StatEvent::STMu);
+                     }
+-
+-                    // Final elapsed time
+-                    if (decoder->isFormatReady()) {
+-                        auto fmt = decoder->getFormat();
+-                        uint64_t decoded = decoder->getDecodedSamples();
+-                        uint32_t elapsedSec = fmt.sampleRate > 0
+-                            ? static_cast<uint32_t>(decoded / fmt.sampleRate) : 0;
+-                        LOG_INFO("[Audio] Stream complete: " << totalBytes << " bytes received, "
+-                                 << decoded << " frames decoded (" << elapsedSec << "s)");
+-                    } else {
+-                        LOG_INFO("[Audio] Stream ended (" << totalBytes << " bytes received)");
+-                    }
+-
+-                    slimproto->sendStat(StatEvent::STMd);  // Decoder finished
+-                    slimproto->sendStat(StatEvent::STMu);  // Underrun (natural end)
+                     audioThreadDone.store(true, std::memory_order_release);
+                 });
+                 break;
+@@ -1130,8 +1161,9 @@ int main(int argc, char* argv[]) {
+ 
+             case STRM_STOP:
+                 LOG_INFO("Stream stop requested");
+-                audioTestRunning.store(false);
++                audioTestRunning.store(false, std::memory_order_release);
+                 httpStream->disconnect();
++                direttaPtr->notifySpaceAvailable();
+                 if (direttaPtr->isPlaying()) direttaPtr->stopPlayback(true);
+                 slimproto->sendStat(StatEvent::STMf);  // Flushed
+                 // Start idle release timer
+@@ -1153,8 +1185,9 @@ int main(int argc, char* argv[]) {
+ 
+             case STRM_FLUSH:
+                 LOG_INFO("Flush requested");
+-                audioTestRunning.store(false);
++                audioTestRunning.store(false, std::memory_order_release);
+                 httpStream->disconnect();
++                direttaPtr->notifySpaceAvailable();
+                 if (direttaPtr->isPlaying()) direttaPtr->stopPlayback(true);
+                 slimproto->sendStat(StatEvent::STMf);
+                 // Start idle release timer
+@@ -1174,8 +1207,9 @@ int main(int argc, char* argv[]) {
+ 
+     // Helper: stop audio thread and wait for it to finish
+     auto stopAudioThread = [&]() {
+-        audioTestRunning.store(false);
++        audioTestRunning.store(false, std::memory_order_release);
+         httpStream->disconnect();
++        direttaPtr->notifySpaceAvailable();
+         if (audioTestThread.joinable()) {
+             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+             while (!audioThreadDone.load(std::memory_order_acquire) &&

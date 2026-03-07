@@ -1726,6 +1726,10 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
     // Pop from ring buffer
     m_ringBuffer.pop(dest, currentBytesPerBuffer);
 
+    // Epoch incremented unconditionally before try_lock — allows sender to
+    // detect pops even when it holds the mutex (avoiding lost wakeups)
+    m_popEpoch.fetch_add(1, std::memory_order_release);
+
     // G1: Signal producer that space is now available
     // Use try_lock to avoid blocking the time-critical consumer thread
     // If producer isn't waiting, this is a no-op (harmless notification)

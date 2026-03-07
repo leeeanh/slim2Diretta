@@ -454,6 +454,32 @@ public:
         m_spaceAvailable.notify_one();
     }
 
+    /**
+     * @brief Wait for buffer space with a stop predicate.
+     * Wakes when predicate returns true OR timeout expires.
+     * Use this to avoid sleeping past a stop/flush signal.
+     *
+     * @param pred  Callable returning bool; checked on each wakeup.
+     *              Returns true = stop waiting immediately.
+     */
+    template<typename Rep, typename Period, typename Pred>
+    bool waitForSpace(std::unique_lock<std::mutex>& lock,
+                      Pred pred,
+                      std::chrono::duration<Rep, Period> timeout) {
+        return m_spaceAvailable.wait_for(lock, timeout, pred);
+    }
+
+    /**
+     * @brief Epoch counter incremented on each SDK worker pop.
+     * Allows sender thread to detect pops without relying solely on
+     * try_lock + notify_one (which can miss when sender holds the mutex).
+     */
+    alignas(64) std::atomic<uint64_t> m_popEpoch{0};
+
+    uint64_t getPopEpoch() const {
+        return m_popEpoch.load(std::memory_order_acquire);
+    }
+
     //=========================================================================
     // Target Management
     //=========================================================================
