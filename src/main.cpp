@@ -1088,6 +1088,7 @@ int main(int argc, char* argv[]) {
                     });
 
                     std::thread senderThread([&]() {
+                        setRealtimePriority(g_rtPriority);
                         while (audioTestRunning.load(std::memory_order_acquire) &&
                                !prebufferReady.load(std::memory_order_acquire) &&
                                !producerDone.load(std::memory_order_acquire)) {

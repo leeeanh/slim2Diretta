@@ -12,26 +12,10 @@
 #include <pthread.h>
 #include <sched.h>
 
-namespace {
-
-// G1: Interruptible wait helper for format transitions
-// Uses condition variable instead of sleep_for to allow shutdown interruption
-// Returns true if wait completed, false if interrupted by wakeup signal
-bool interruptibleWait(std::mutex& mutex, std::condition_variable& cv,
-                       std::atomic<bool>& wakeupFlag, int timeoutMs) {
-    std::unique_lock<std::mutex> lock(mutex);
-    bool interrupted = cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                                   [&wakeupFlag]() { return wakeupFlag.load(std::memory_order_acquire); });
-    if (interrupted) {
-        wakeupFlag.store(false, std::memory_order_release);  // Reset for next use
-    }
-    return !interrupted;  // Return true if timeout (normal), false if interrupted
-}
-
-// F1: Worker thread priority elevation for reduced jitter
+// F1: Thread priority elevation for reduced jitter
 // Sets SCHED_FIFO real-time priority (requires root on Linux)
 // Returns true on success, false on failure (logs warning but continues)
-bool setRealtimePriority(int priority = 50) {
+bool setRealtimePriority(int priority) {
     struct sched_param param;
     param.sched_priority = priority;
 
@@ -46,9 +30,25 @@ bool setRealtimePriority(int priority = 50) {
     }
 
     if (g_verbose) {
-        std::cout << "[DirettaSync] Worker thread set to SCHED_FIFO priority " << priority << std::endl;
+        std::cout << "[DirettaSync] Thread set to SCHED_FIFO priority " << priority << std::endl;
     }
     return true;
+}
+
+namespace {
+
+// G1: Interruptible wait helper for format transitions
+// Uses condition variable instead of sleep_for to allow shutdown interruption
+// Returns true if wait completed, false if interrupted by wakeup signal
+bool interruptibleWait(std::mutex& mutex, std::condition_variable& cv,
+                       std::atomic<bool>& wakeupFlag, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(mutex);
+    bool interrupted = cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                   [&wakeupFlag]() { return wakeupFlag.load(std::memory_order_acquire); });
+    if (interrupted) {
+        wakeupFlag.store(false, std::memory_order_release);  // Reset for next use
+    }
+    return !interrupted;  // Return true if timeout (normal), false if interrupted
 }
 
 class RingAccessGuard {

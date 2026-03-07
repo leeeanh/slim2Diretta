@@ -104,6 +104,7 @@ extern LogRing* g_logRing;
 
 extern bool g_verbose;
 extern int g_rtPriority;
+bool setRealtimePriority(int priority);
 #include "LogLevel.h"
 
 #ifdef NOLOG
