@@ -54,10 +54,10 @@ static constexpr size_t OUTPUT_COMPACT_THRESHOLD_SAMPLES = 16384;
 **Step 3: Build to confirm no errors**
 
 ```bash
-cd build && make -j$(nproc) 2>&1 | grep -E "error:|warning:"
+cd build && make -j$(nproc)
 ```
 
-Expected: no errors, no new warnings.
+Expected: exits 0. Review terminal output for any `error:` or `warning:` lines before proceeding.
 
 **Step 4: Commit**
 
@@ -145,10 +145,10 @@ Key differences from the original:
 **Step 2: Build**
 
 ```bash
-cd build && make -j$(nproc) 2>&1 | grep -E "error:|warning:"
+cd build && make -j$(nproc)
 ```
 
-Expected: no errors, no new warnings.
+Expected: exits 0. Review terminal output for any `error:` or `warning:` lines before proceeding.
 
 **Step 3: Manually verify the invariant holds**
 
@@ -218,10 +218,10 @@ if (confirmedBufPos >= INPUT_COMPACT_THRESHOLD_BYTES &&
 **Step 2: Build**
 
 ```bash
-cd build && make -j$(nproc) 2>&1 | grep -E "error:|warning:"
+cd build && make -j$(nproc)
 ```
 
-Expected: no errors, no new warnings.
+Expected: exits 0. Review terminal output for any `error:` or `warning:` lines before proceeding.
 
 **Step 3: Verify rollback path is unaffected**
 
@@ -265,7 +265,7 @@ Read the full `readDecoded()` function in `src/FlacDecoder.cpp`. Confirm:
 1. Metadata/audio boundary erase (`FlacDecoder.cpp:146`) is still unconditional — correct, it fires once per stream.
 2. Input compaction gate fires only when `confirmedBufPos >= INPUT_COMPACT_THRESHOLD_BYTES` and the two-condition heuristic is satisfied.
 3. Output compaction gate fires only when `m_outputPos >= OUTPUT_COMPACT_THRESHOLD_SAMPLES` and the two-condition heuristic is satisfied.
-4. `m_tellOffset` is updated in exactly one place: inside the input gate.
+4. `m_tellOffset` is updated in exactly three places: the one-shot metadata/audio boundary erase (~line 149) and its fallback path (~line 154) — both unchanged — and inside the new input compaction gate. Confirm no new updates to `m_tellOffset` exist outside these three sites. Do not remove or modify the existing metadata-phase updates; they are required for `tellCallback` to return a correct absolute position after metadata handling.
 5. `m_outputPos = 0` is set in exactly one place: inside the output gate.
 6. `flush()` still clears both buffers and resets both offsets to zero.
 
