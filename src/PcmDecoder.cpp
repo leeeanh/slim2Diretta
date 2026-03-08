@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <cstddef>
 
 // Minimum header sizes
 static constexpr size_t WAV_MIN_HEADER = 44;   // RIFF(12) + fmt(24) + data(8)
@@ -67,7 +68,7 @@ size_t PcmDecoder::readDecoded(int32_t* out, size_t maxFrames) {
     if (bytesPerFrame == 0) return 0;
 
     // Limit by available data and remaining chunk size
-    size_t availBytes = m_dataBuf.size();
+    size_t availBytes = m_dataBuf.size() - m_readPos;
     if (m_dataRemaining > 0) {
         availBytes = std::min(availBytes, static_cast<size_t>(m_dataRemaining));
     }
@@ -87,15 +88,26 @@ size_t PcmDecoder::readDecoded(int32_t* out, size_t maxFrames) {
     }
 
     size_t bytesToConvert = framesToConvert * bytesPerFrame;
-    convertSamples(m_dataBuf.data(), out, bytesToConvert);
+    convertSamples(m_dataBuf.data() + m_readPos, out, bytesToConvert);
 
-    // Consume from data buffer
-    m_dataBuf.erase(m_dataBuf.begin(), m_dataBuf.begin() + bytesToConvert);
+    // Consume from data buffer — advance read offset, compact only when worthwhile
+    m_readPos += bytesToConvert;
     if (m_dataRemaining > 0) {
         m_dataRemaining -= bytesToConvert;
         if (m_dataRemaining == 0) {
             m_finished = true;
         }
+    }
+
+    // Compact: only when the consumed front is worth reclaiming.
+    // Condition: offset is past threshold AND (offset is majority of buffer OR
+    // unread tail is itself below threshold — avoids large memmoves on small gains).
+    size_t unread = m_dataBuf.size() - m_readPos;
+    if (m_readPos >= COMPACT_THRESHOLD &&
+        (m_readPos >= m_dataBuf.size() / 2 || unread < COMPACT_THRESHOLD)) {
+        m_dataBuf.erase(m_dataBuf.begin(),
+                        m_dataBuf.begin() + static_cast<std::ptrdiff_t>(m_readPos));
+        m_readPos = 0;
     }
 
     m_decodedSamples += framesToConvert;
@@ -117,6 +129,7 @@ void PcmDecoder::flush() {
     m_state = State::DETECT;
     m_headerBuf.clear();
     m_dataBuf.clear();
+    m_readPos = 0;
     m_format = {};
     m_formatReady = false;
     m_bigEndian = false;

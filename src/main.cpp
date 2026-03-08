@@ -23,6 +23,7 @@
 #include <atomic>
 #include <iomanip>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <mutex>
 #include <optional>
@@ -893,6 +894,10 @@ int main(int argc, char* argv[]) {
 
                     uint8_t httpBuf[65536];
                     constexpr size_t MAX_DECODE_FRAMES = 1024;
+                    constexpr size_t HTTP_READ_MIN    =  4096;
+                    constexpr size_t HTTP_READ_STEADY =  8192;
+                    constexpr size_t HTTP_READ_HIGH   = 16384;
+                    constexpr size_t HTTP_READ_BURST  = 65536;
                     int32_t decodeBuf[MAX_DECODE_FRAMES * 2];
                     uint64_t totalBytes = 0;
                     bool formatLogged = false;
@@ -992,7 +997,24 @@ int main(int argc, char* argv[]) {
                             bool gotData = false;
                             if (cacheFreeFrames() > 0) {
                                 if (httpStream->isConnected()) {
-                                    ssize_t n = httpStream->readWithTimeout(httpBuf, sizeof(httpBuf), 2);
+                                    // Adaptive read size: burst during prebuffer, cache-pressure-banded
+                                    // in steady state based on decoded-frame cache occupancy.
+                                    size_t readSize;
+                                    if (!prebufferReady.load(std::memory_order_relaxed)) {
+                                        readSize = HTTP_READ_BURST;
+                                    } else {
+                                        size_t free = cacheFreeFrames();
+                                        size_t total = DECODE_CACHE_MAX_SAMPLES
+                                                       / static_cast<size_t>(std::max(detectedChannels, 1));
+                                        float fillRatio = (total > 0)
+                                            ? 1.0f - static_cast<float>(free) / static_cast<float>(total)
+                                            : 1.0f;
+
+                                        if      (fillRatio > 0.80f) readSize = HTTP_READ_MIN;
+                                        else if (fillRatio > 0.50f) readSize = HTTP_READ_STEADY;
+                                        else                        readSize = HTTP_READ_HIGH;
+                                    }
+                                    ssize_t n = httpStream->readWithTimeout(httpBuf, readSize, 2);
                                     if (n > 0) {
                                         gotData = true;
                                         totalBytes += static_cast<uint64_t>(n);
@@ -1086,6 +1108,16 @@ int main(int argc, char* argv[]) {
                         producerDone.store(true, std::memory_order_release);
                         LOG_DEBUG("[Producer] Done. totalBytes=" << totalBytes);
                     });
+
+                    enum class SenderMode { kRecovery, kSteady };
+                    constexpr float  RECOVERY_TARGET         = 0.90f;
+                    constexpr float  STEADY_ENTER            = 0.75f;
+                    constexpr float  STEADY_EXIT             = 0.40f;
+                    constexpr float  STEADY_CEILING          = 0.65f;
+                    constexpr float  STEADY_CHUNK_MS         = 2.0f;
+                    constexpr size_t STEADY_CHUNK_MIN_FRAMES = 128;
+                    constexpr size_t STEADY_CHUNK_MAX_FRAMES = 512;
+                    SenderMode senderMode = SenderMode::kRecovery;
 
                     std::thread senderThread([&]() {
                         setRealtimePriority(g_rtPriority);
@@ -1225,12 +1257,36 @@ int main(int argc, char* argv[]) {
                                 continue;
                             }
 
-                            while (audioTestRunning.load(std::memory_order_relaxed) &&
-                                   direttaPtr->getBufferLevel() <= 0.95f) {
-                                size_t contiguous = cacheContiguousFrames();
-                                if (contiguous == 0) break;
-                                size_t chunk = std::min(contiguous, MAX_DECODE_FRAMES);
-                                sendChunk(chunk);
+                            // State transition once per wakeup with hysteresis to prevent mode flap.
+                            float level = direttaPtr->getBufferLevel();
+                            if (senderMode == SenderMode::kRecovery && level >= STEADY_ENTER) {
+                                senderMode = SenderMode::kSteady;
+                            } else if (senderMode == SenderMode::kSteady && level < STEADY_EXIT) {
+                                senderMode = SenderMode::kRecovery;
+                            }
+
+                            if (senderMode == SenderMode::kRecovery) {
+                                while (audioTestRunning.load(std::memory_order_relaxed) &&
+                                       direttaPtr->getBufferLevel() < RECOVERY_TARGET) {
+                                    size_t contiguous = cacheContiguousFrames();
+                                    if (contiguous == 0) break;
+                                    sendChunk(std::min(contiguous, MAX_DECODE_FRAMES));
+                                }
+                            } else {
+                                uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+                                size_t steadyChunkFrames = (rate > 0)
+                                    ? std::clamp(
+                                          static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
+                                          STEADY_CHUNK_MIN_FRAMES,
+                                          STEADY_CHUNK_MAX_FRAMES)
+                                    : STEADY_CHUNK_MIN_FRAMES;
+
+                                if (direttaPtr->getBufferLevel() < STEADY_CEILING) {
+                                    size_t contiguous = cacheContiguousFrames();
+                                    if (contiguous > 0) {
+                                        sendChunk(std::min(contiguous, steadyChunkFrames));
+                                    }
+                                }
                             }
 
                             if (audioFmtReady.load(std::memory_order_relaxed)) {

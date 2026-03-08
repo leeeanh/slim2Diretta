@@ -47,6 +47,8 @@ private:
 
     // PCM data buffer (raw bytes before conversion)
     std::vector<uint8_t> m_dataBuf;
+    size_t m_readPos = 0;  // Offset into m_dataBuf: unread data starts here
+    static constexpr size_t COMPACT_THRESHOLD = 65536;
 
     // Format
     DecodedFormat m_format;
