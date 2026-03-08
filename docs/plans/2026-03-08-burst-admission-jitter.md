@@ -156,6 +156,7 @@ Read `src/FlacDecoder.h` lines 60–101 and `src/FlacDecoder.cpp` lines 95–162
 In the members section, after `m_metadataDone`:
 ```cpp
     bool m_metadataPrescanDone = false;  // Pre-scan confirmed all metadata bytes present
+                                          // (or stream confirmed as seek/mid-frame start)
 ```
 
 After `m_shift`:
@@ -163,72 +164,45 @@ After `m_shift`:
     uint32_t m_maxBlocksize = 0;  // From STREAMINFO; 0 if not yet seen
 ```
 
+**Restore the lazy `initDecoder()` call to the top of `readDecoded()`**, before Phase 1.
+The current code already has this at lines 82–84; the new Phase 1 code must NOT move it
+inside the metadata gate, because seek streams (which skip `process_until_end_of_metadata`)
+still need the decoder initialized before Phase 2 audio decode begins.
+
 **Update the file comment** (lines 10–12). Remove the line:
 ```
  * - During metadata: ABORT → reset() (back to SEARCH_FOR_METADATA)
 ```
 Replace with:
 ```
- * - During metadata: byte-level pre-scan gates init; no recreate loop
+ * - During metadata: byte-level pre-scan gates init; seek streams skip phase entirely
 ```
 
 ### Step 3: Replace Phase 1 in `FlacDecoder.cpp`
 
-The current Phase 1 block is lines 95–162. Replace the entire block:
+The current Phase 1 block is lines 95–162. Replace the entire block.
+
+**Key structural constraints:**
+- The lazy `initDecoder()` call must remain at the **top of `readDecoded()`** (lines 82–84),
+  not inside Phase 1. Seek streams skip `process_until_end_of_metadata` and fall straight to
+  Phase 2 audio decode, which needs the decoder already initialized.
+- `process_until_end_of_metadata` must only run for full FLAC streams. It is guarded by
+  an inner `if (!m_metadataDone)` so seek streams (which set `m_metadataDone = true` in the
+  prescan branch) bypass it.
+
+Replace with:
 
 ```cpp
     if (!m_metadataDone) {
-        size_t savedPos = m_inputPos;
-
-        if (!FLAC__stream_decoder_process_until_end_of_metadata(m_decoder)) {
-            FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(m_decoder);
-
-            if (state == FLAC__STREAM_DECODER_ABORTED) {
-                // Not enough data for all metadata — need more input
-                m_inputPos = savedPos;  // Rollback: keep all data
-                FLAC__stream_decoder_delete(m_decoder);
-                m_decoder = nullptr;
-                m_initialized = false;
-                m_metadataRetries++;
-                // Log first attempt and then only every 50th to avoid spam
-                // (Qobuz streams with large album art can need 100+ retries)
-                if (m_metadataRetries == 1) {
-                    LOG_DEBUG("[FLAC] Metadata incomplete, need more data ("
-                              << m_inputBuffer.size() << " bytes buffered)");
-                } else if (m_metadataRetries % 50 == 0) {
-                    LOG_DEBUG("[FLAC] Metadata still incomplete after "
-                              << m_metadataRetries << " retries ("
-                              << m_inputBuffer.size() << " bytes buffered)");
-                }
-                return 0;
-            }
-            ...
-        }
-        m_metadataDone = true;
-        if (m_metadataRetries > 0) {
-            LOG_DEBUG("[FLAC] Metadata complete after " << m_metadataRetries
-                      << " retries (" << m_inputBuffer.size() << " bytes buffered)");
-        } else {
-            LOG_DEBUG("[FLAC] Metadata complete, starting audio decode");
-        }
-        ...
-    }
-```
-
-with:
-
-```cpp
-    if (!m_metadataDone) {
-        // ----------------------------------------------------------------
-        // Pre-scan: confirm all metadata bytes are present before
-        // constructing the libFLAC decoder. Avoids recreate/retry churn
-        // on streams with large album-art blocks.
-        // ----------------------------------------------------------------
+        // ---------------------------------------------------------------
+        // Pre-scan: confirm all metadata bytes are present before calling
+        // libFLAC. Seek/mid-stream restarts (no fLaC magic) skip the
+        // metadata phase entirely; libFLAC resyncs via LOST_SYNC.
+        // ---------------------------------------------------------------
         if (!m_metadataPrescanDone) {
             const uint8_t* buf = m_inputBuffer.data();
             size_t bufSize = m_inputBuffer.size();
 
-            // Need at least the FLAC magic
             if (bufSize < 4) {
                 if (m_eof) {
                     LOG_ERROR("[FLAC] Stream ended before FLAC signature");
@@ -237,111 +211,100 @@ with:
                 return 0;
             }
 
-            // Validate FLAC signature — fail immediately (don't wait for more bytes)
             if (std::memcmp(buf, "fLaC", 4) != 0) {
-                LOG_ERROR("[FLAC] Invalid FLAC signature: 0x"
-                          << std::hex
-                          << (int)buf[0] << (int)buf[1]
-                          << (int)buf[2] << (int)buf[3] << std::dec);
+                // Seek/mid-stream start: skip metadata, decode from first frame.
+                LOG_DEBUG("[FLAC] No fLaC magic — seek/mid-stream start, skipping metadata phase");
+                m_metadataPrescanDone = true;
+                m_metadataDone = true;
+                // inner if (!m_metadataDone) below is skipped; falls through to Phase 2.
+            } else {
+                // Full FLAC stream: scan block headers until last-metadata bit.
+                size_t pos = 4;
+                bool foundLast = false;
+                while (true) {
+                    if (pos + 4 > bufSize) {
+                        if (m_eof) {
+                            LOG_ERROR("[FLAC] Stream truncated in metadata block header");
+                            m_error = true;
+                        }
+                        return 0;
+                    }
+
+                    bool isLast  = (buf[pos] & 0x80) != 0;
+                    size_t blockLen = (static_cast<size_t>(buf[pos + 1]) << 16)
+                                    | (static_cast<size_t>(buf[pos + 2]) <<  8)
+                                    |  static_cast<size_t>(buf[pos + 3]);
+                    size_t blockEnd = pos + 4 + blockLen;
+
+                    if (blockEnd > bufSize) {
+                        if (m_eof) {
+                            LOG_ERROR("[FLAC] Stream truncated inside metadata block ("
+                                      << blockLen << " bytes expected, "
+                                      << (bufSize - pos - 4) << " available)");
+                            m_error = true;
+                        }
+                        return 0;
+                    }
+
+                    pos = blockEnd;
+                    if (isLast) { foundLast = true; break; }
+                }
+
+                if (!foundLast) return 0;  // unreachable; loop always returns or breaks
+
+                m_metadataPrescanDone = true;
+                LOG_DEBUG("[FLAC] Pre-scan complete: " << pos << " metadata bytes confirmed ("
+                          << bufSize << " buffered)");
+            }
+        }  // end if (!m_metadataPrescanDone)
+
+        // For full FLAC streams: process metadata exactly once.
+        // Seek streams set m_metadataDone = true above, so this block is skipped.
+        if (!m_metadataDone) {
+            if (!FLAC__stream_decoder_process_until_end_of_metadata(m_decoder)) {
+                FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(m_decoder);
+                if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
+                    m_finished = true;
+                    return 0;
+                }
+                // Pre-scan confirmed bytes present; ABORT here means corruption
+                LOG_ERROR("[FLAC] Metadata processing failed after pre-scan (state="
+                          << FLAC__StreamDecoderStateString[state]
+                          << ") — stream likely corrupt");
                 m_error = true;
                 return 0;
             }
 
-            size_t pos = 4;
-            bool foundLast = false;
-            while (true) {
-                if (pos + 4 > bufSize) {
-                    // Need block header bytes
-                    if (m_eof) {
-                        LOG_ERROR("[FLAC] Stream truncated in metadata block header");
-                        m_error = true;
-                    }
-                    return 0;
+            m_metadataDone = true;
+            LOG_DEBUG("[FLAC] Metadata complete, starting audio decode");
+
+            // Reserve output buffer from STREAMINFO max_blocksize (if available)
+            if (m_maxBlocksize > 0 && m_format.channels > 0) {
+                size_t target = static_cast<size_t>(m_maxBlocksize) * m_format.channels * 4;
+                if (m_outputBuffer.capacity() < target) m_outputBuffer.reserve(target);
+            }
+
+            // Compact metadata bytes: use get_decode_position to find exact audio boundary
+            FLAC__uint64 absPos;
+            if (FLAC__stream_decoder_get_decode_position(m_decoder, &absPos)) {
+                size_t audioStart = static_cast<size_t>(absPos - m_tellOffset);
+                if (audioStart > 0 && audioStart <= m_inputBuffer.size()) {
+                    m_inputBuffer.erase(m_inputBuffer.begin(),
+                                        m_inputBuffer.begin() + audioStart);
+                    m_inputPos -= audioStart;
+                    m_tellOffset += audioStart;
                 }
-
-                bool isLast  = (buf[pos] & 0x80) != 0;
-                size_t blockLen = (static_cast<size_t>(buf[pos + 1]) << 16)
-                                | (static_cast<size_t>(buf[pos + 2]) <<  8)
-                                |  static_cast<size_t>(buf[pos + 3]);
-                size_t blockEnd = pos + 4 + blockLen;
-
-                if (blockEnd > bufSize) {
-                    // Need block body bytes — no byte-count cap, just wait
-                    if (m_eof) {
-                        LOG_ERROR("[FLAC] Stream truncated inside metadata block ("
-                                  << blockLen << " bytes expected, "
-                                  << (bufSize - pos - 4) << " available)");
-                        m_error = true;
-                    }
-                    return 0;
-                }
-
-                pos = blockEnd;
-
-                if (isLast) {
-                    foundLast = true;
-                    break;
+            } else {
+                if (m_inputPos > 0) {
+                    m_tellOffset += m_inputPos;
+                    m_inputBuffer.erase(m_inputBuffer.begin(),
+                                        m_inputBuffer.begin() + m_inputPos);
+                    m_inputPos = 0;
                 }
             }
-
-            if (!foundLast) {
-                // Loop exited without finding last block — should not reach here
-                return 0;
-            }
-
-            m_metadataPrescanDone = true;
-            LOG_DEBUG("[FLAC] Pre-scan complete: " << pos << " metadata bytes confirmed ("
-                      << bufSize << " buffered), initialising decoder");
+            m_confirmedAbsolutePos = m_tellOffset;
         }
-
-        // All metadata bytes are in the buffer — init and process exactly once
-        if (!m_initialized) {
-            if (!initDecoder()) return 0;
-        }
-
-        if (!FLAC__stream_decoder_process_until_end_of_metadata(m_decoder)) {
-            FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(m_decoder);
-            if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
-                m_finished = true;
-                return 0;
-            }
-            // Pre-scan confirmed all bytes are present; ABORT here means corruption
-            LOG_ERROR("[FLAC] Metadata processing failed after pre-scan (state="
-                      << FLAC__StreamDecoderStateString[state]
-                      << ") — stream likely corrupt");
-            m_error = true;
-            return 0;
-        }
-
-        m_metadataDone = true;
-        LOG_DEBUG("[FLAC] Metadata complete, starting audio decode");
-
-        // Reserve output buffer capacity from STREAMINFO max_blocksize (if available)
-        if (m_maxBlocksize > 0 && m_format.channels > 0) {
-            size_t target = static_cast<size_t>(m_maxBlocksize) * m_format.channels * 4;
-            if (m_outputBuffer.capacity() < target) m_outputBuffer.reserve(target);
-        }
-
-        // Use get_decode_position to find exact metadata/audio boundary.
-        FLAC__uint64 absPos;
-        if (FLAC__stream_decoder_get_decode_position(m_decoder, &absPos)) {
-            size_t audioStart = static_cast<size_t>(absPos - m_tellOffset);
-            if (audioStart > 0 && audioStart <= m_inputBuffer.size()) {
-                m_inputBuffer.erase(m_inputBuffer.begin(),
-                                    m_inputBuffer.begin() + audioStart);
-                m_inputPos -= audioStart;
-                m_tellOffset += audioStart;
-            }
-        } else {
-            if (m_inputPos > 0) {
-                m_tellOffset += m_inputPos;
-                m_inputBuffer.erase(m_inputBuffer.begin(),
-                                    m_inputBuffer.begin() + m_inputPos);
-                m_inputPos = 0;
-            }
-        }
-        m_confirmedAbsolutePos = m_tellOffset;
-    }
+    }  // end if (!m_metadataDone)
 ```
 
 ### Step 4: Update `metadataCallback` to capture `max_blocksize`
@@ -451,34 +414,55 @@ static size_t pcmDataBufReserve(uint32_t bytesPerFrame, uint32_t sampleRate) {
 
 ### Step 3: Call reserve in `parseWavHeader`
 
-In `parseWavHeader`, just before the block that moves data from `m_headerBuf` to `m_dataBuf` (around line 266):
+**WAV EXTENSIBLE note**: `parseWavHeader` already rewrites `m_format.bitDepth` from the
+container `wBitsPerSample` to `wValidBitsPerSample` for EXTENSIBLE files (e.g. 32→24). The
+data arriving in `m_dataBuf` is at the *container* width, not the valid-bit width. Capture
+`wBitsPerSample` *before* the override and use it for the reserve.
+
+Locate the existing `wBitsPerSample` / `wValidBitsPerSample` block in `parseWavHeader`:
 
 ```cpp
-    // Existing lines:
-    // m_shift = 32 - m_format.bitDepth;
-    // m_format.totalSamples = ...;
-    // m_formatReady = true;
-    // LOG_INFO("[PCM] WAV: ...");
+    m_format.bitDepth = readLE16(p + pos + 22);  // wBitsPerSample (container width)
+```
 
-    // Add before the m_dataBuf insert:
-    {
-        uint32_t bytesPerFrame = (m_format.bitDepth / 8) * m_format.channels;
-        size_t target = pcmDataBufReserve(bytesPerFrame, m_format.sampleRate);
-        if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
-    }
+Immediately after that line, save the container width before any override:
 
-    // Existing: move remaining header bytes to data buffer
-    if (dataStart < m_headerBuf.size()) {
-        m_dataBuf.insert(m_dataBuf.end(), ...);
+```cpp
+    uint16_t containerBitsPerSample = static_cast<uint16_t>(m_format.bitDepth);
+    // EXTENSIBLE: wValidBitsPerSample may differ from container size
+    if (isExtensible) {
+        uint16_t validBits = readLE16(p + pos + 8 + 18);
+        if (validBits > 0) {
+            m_format.bitDepth = validBits;  // existing override — unchanged
+        }
     }
 ```
 
-### Step 4: Call reserve in `parseAiffHeader`
-
-Same pattern, same location relative to the SSND payload copy (around line 335):
+Then, just before the block that moves data from `m_headerBuf` to `m_dataBuf` (after
+`LOG_INFO("[PCM] WAV: ...")`):
 
 ```cpp
-    // Add before the m_dataBuf insert:
+    {
+        uint32_t containerBytesPerFrame = (containerBitsPerSample / 8) * m_format.channels;
+        size_t target = pcmDataBufReserve(containerBytesPerFrame, m_format.sampleRate);
+        if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
+    }
+    if (dataStart < m_headerBuf.size()) {
+        m_dataBuf.insert(m_dataBuf.end(), ...);  // existing
+    }
+```
+
+For non-EXTENSIBLE WAV, `containerBitsPerSample == m_format.bitDepth`, so the result is
+identical to the naive formula. For EXTENSIBLE 24-in-32, this correctly gives 4 bytes/sample
+instead of 3.
+
+### Step 4: Call reserve in `parseAiffHeader`
+
+AIFF stores samples at their declared bit depth with no container/valid distinction, so
+`m_format.bitDepth / 8 * channels` is the correct byte count. Add just before the SSND
+payload copy (around line 335):
+
+```cpp
     {
         uint32_t bytesPerFrame = (m_format.bitDepth / 8) * m_format.channels;
         size_t target = pcmDataBufReserve(bytesPerFrame, m_format.sampleRate);
@@ -488,14 +472,15 @@ Same pattern, same location relative to the SSND payload copy (around line 335):
 
 ### Step 5: Call reserve in `detectContainer` raw PCM path
 
-In `detectContainer`, the raw PCM branch (around line 163) sets `m_formatReady = true` then moves `m_headerBuf` to `m_dataBuf`. Add the reserve before the move:
+Raw PCM format is set by `setRawPcmFormat(sampleRate, bitDepth, channels, bigEndian)` with
+explicit `bitDepth` representing the actual storage width. Add before the `m_dataBuf.insert`
+(around line 163):
 
 ```cpp
     if (m_rawPcmConfigured) {
         m_formatReady = true;
         m_dataRemaining = 0;
 
-        // Add:
         {
             uint32_t bytesPerFrame = (m_format.bitDepth / 8) * m_format.channels;
             size_t target = pcmDataBufReserve(bytesPerFrame, m_format.sampleRate);
@@ -580,7 +565,9 @@ commit for streams with STREAMINFO."
 After all three commits:
 
 - [ ] `make` builds cleanly with no warnings
-- [ ] FLAC playback: no `Metadata incomplete` retry log spam; single `Pre-scan complete` log
+- [ ] FLAC playback (full stream): no `Metadata incomplete` retry log spam; single `Pre-scan complete` log
+- [ ] FLAC seek/mid-stream restart: `No fLaC magic — seek/mid-stream start` log appears; audio decodes without error
+- [ ] WAV EXTENSIBLE (24-in-32): reserve uses 4 bytes/sample not 3; verify with `LOG_DEBUG` during development, remove before commit
 - [ ] Recovery after starvation: buffer level climbs in visible steps rather than one spike to 90%
 - [ ] WAV and AIFF playback: no regressions in format detection or audio quality
 - [ ] `git log --oneline -5` shows three clean perf commits in order

@@ -112,7 +112,9 @@ solely by stream completion (all bytes arrived) or EOF (truncated/corrupt stream
 ```
 1. if (m_inputBuffer.size() < 4 && !m_eof)   → return 0 (wait for more data)
    if (m_inputBuffer.size() < 4 &&  m_eof)   → log error, set m_error, return 0
-2. if (memcmp(buf, "fLaC", 4) != 0)          → log error, set m_error, return 0
+2. if (memcmp(buf, "fLaC", 4) != 0)          → seek/mid-stream start: set m_metadataPrescanDone
+                                                and m_metadataDone immediately, skip metadata
+                                                phase entirely, fall through to audio decode
 3. pos = 4
 4. loop:
      if (pos + 4 > m_inputBuffer.size())
@@ -161,16 +163,34 @@ a retry trigger.
 
 ### 3a: PCM `m_dataBuf` (`PcmDecoder.cpp`)
 
-After `parseWavHeader()` or `parseAiffHeader()` resolves `bytesPerFrame` and `sampleRate`,
-apply a one-shot reserve before copying the audio payload from `m_headerBuf` into `m_dataBuf`.
-Only grow, never shrink:
+After the container header is parsed and the format is known, apply a one-shot reserve before
+copying the audio payload from `m_headerBuf` into `m_dataBuf`. Only grow, never shrink:
 
 ```cpp
-size_t target = static_cast<size_t>(bytesPerFrame) * sampleRate / 4;  // ~250ms raw PCM
-target = (target + 65535u) & ~65535u;                                   // round up to 64KB
+size_t target = static_cast<size_t>(containerBytesPerFrame) * sampleRate / 4;  // ~250ms raw PCM
+target = (target + 65535u) & ~65535u;                                            // round up to 64KB
 target = std::clamp(target, size_t(128 * 1024), size_t(512 * 1024));
 if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
 ```
+
+**`containerBytesPerFrame`**, not `m_format.bitDepth / 8 * channels`: For WAV EXTENSIBLE
+files, `parseWavHeader()` overwrites `m_format.bitDepth` with `wValidBitsPerSample` (e.g. 24)
+after reading `wBitsPerSample` (the container width, e.g. 32). The bytes arriving in
+`m_dataBuf` are at the container width, not the valid-bit width. The reserve must use
+the container sample size. Capture `wBitsPerSample` before the valid-bits override:
+
+```cpp
+uint16_t containerBitsPerSample = readLE16(p + pos + 22);  // wBitsPerSample (container)
+m_format.bitDepth = containerBitsPerSample;
+if (isExtensible) {
+    uint16_t validBits = readLE16(p + pos + 8 + 18);
+    if (validBits > 0) m_format.bitDepth = validBits;  // valid-bits override
+}
+uint32_t containerBytesPerFrame = (containerBitsPerSample / 8) * m_format.channels;
+```
+
+For AIFF and raw PCM, `m_format.bitDepth` is the actual storage width, so
+`containerBytesPerFrame = (m_format.bitDepth / 8) * channels` is correct.
 
 Same formula applied in the raw PCM path (`detectContainer`, before transitioning to
 `State::DATA`). The constructor reserve of 32768 bytes is kept as a startup floor for the
