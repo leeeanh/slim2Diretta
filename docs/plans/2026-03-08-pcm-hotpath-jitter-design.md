@@ -1,8 +1,8 @@
 # PCM Hot-Path Jitter Reduction — Design
 
 **Date**: 2026-03-08
-**Status**: Approved
-**Scope**: `src/PcmDecoder.cpp/h`, `src/main.cpp`, `diretta/DirettaSync.h`
+**Status**: Approved (revised after plan review)
+**Scope**: `src/PcmDecoder.cpp/h`, `src/main.cpp`
 
 ---
 
@@ -99,34 +99,48 @@ if (!prebufferReady) {
 
 ### Fix 3: Two-mode sender refill policy
 
-**Files**: `src/main.cpp` (sender loop), `diretta/DirettaSync.h` (new accessor)
+**File**: `src/main.cpp` (sender loop only — no DirettaSync changes)
 
-#### New DirettaSync accessor
+#### Why not a frame-count cap
 
-```cpp
-// Returns base callback frame count: rate / 1000 (integer division).
-// Does NOT expose the remainder-accumulator state — base frames are
-// sufficient and stable for sender pacing purposes.
-size_t getFramesPerBuffer() const {
-    return static_cast<size_t>(m_sampleRate.load(std::memory_order_relaxed)) / 1000;
-}
-```
+An earlier draft capped steady-mode fills using `getFramesPerBuffer()` from
+`DirettaSync`. This was rejected for three reasons:
+
+1. **DoP frame unit mismatch** — `sendChunk(N)` sends N sender-cache frames. For DoP,
+   each carrier frame is expanded 16× inside `sendAudio()`. Sink callback frame counts
+   don't map back to sender frames without knowing the conversion factor.
+2. **Stale `m_sampleRate` in DSD mode** — `configureRingDSD()` does not update
+   `m_sampleRate`, so any accessor based on it returns a PCM-era value in DSD mode.
+3. **Ring creep** — with 2 × framesPerBuffer sent per wakeup (one wakeup per SDK pop),
+   average fill rate exceeds drain rate and the ring fills over time. Even 1× only
+   keeps up exactly, with no tolerance for a missed wakeup.
+
+#### Approach: level ceiling + rate-derived chunk size
+
+The ring level already answers "should I send?" more directly than frame arithmetic.
+Steady mode sends one small chunk per wakeup, gated by a fill ceiling. Chunk size is
+derived from the sender's own rate — `dopPcmRate` for DoP, `snapshotSampleRate` for
+PCM — which is always in sender-cache frame units and requires no DirettaSync format
+knowledge.
 
 #### Sender state machine
 
 ```cpp
 enum class SenderMode { kRecovery, kSteady };
 
-constexpr float RECOVERY_TARGET = 0.90f;  // fill to here in recovery
-constexpr float STEADY_ENTER    = 0.75f;  // enter steady once ring is above this
-constexpr float STEADY_EXIT     = 0.40f;  // drop back to recovery below this
-constexpr int   STEADY_CHUNKS_PER_WAKEUP = 2;
+constexpr float  RECOVERY_TARGET         = 0.90f;  // fill to here in recovery
+constexpr float  STEADY_ENTER            = 0.75f;  // enter steady once ring is above this
+constexpr float  STEADY_EXIT             = 0.40f;  // drop back to recovery below this
+constexpr float  STEADY_CEILING          = 0.65f;  // max fill allowed in steady mode
+constexpr float  STEADY_CHUNK_MS         = 2.0f;   // target chunk duration (ms)
+constexpr size_t STEADY_CHUNK_MIN_FRAMES = 128;
+constexpr size_t STEADY_CHUNK_MAX_FRAMES = 512;
 
-SenderMode senderMode = SenderMode::kRecovery;  // start in recovery
+SenderMode senderMode = SenderMode::kRecovery;
 
-// --- Per-wakeup logic (replaces current getBufferLevel() <= 0.95f loop) ---
+// --- Per-wakeup logic ---
 
-// 1. State transition — once per wakeup, outside all inner loops
+// 1. State transition — once per wakeup, outside all fill loops
 float level = direttaPtr->getBufferLevel();
 if (senderMode == SenderMode::kRecovery && level >= STEADY_ENTER)
     senderMode = SenderMode::kSteady;
@@ -135,6 +149,7 @@ else if (senderMode == SenderMode::kSteady && level < STEADY_EXIT)
 
 // 2. Fill decision for this wakeup
 if (senderMode == SenderMode::kRecovery) {
+    // Aggressive fill: used at startup, after stalls, and after seek/rebuffer
     while (audioTestRunning.load(std::memory_order_relaxed) &&
            direttaPtr->getBufferLevel() < RECOVERY_TARGET) {
         size_t contiguous = cacheContiguousFrames();
@@ -142,26 +157,34 @@ if (senderMode == SenderMode::kRecovery) {
         sendChunk(std::min(contiguous, MAX_DECODE_FRAMES));
     }
 } else {
-    size_t frameCap = STEADY_CHUNKS_PER_WAKEUP * direttaPtr->getFramesPerBuffer();
-    size_t framesSent = 0;
-    while (audioTestRunning.load(std::memory_order_relaxed) &&
-           framesSent < frameCap) {
+    // Steady: one rate-derived chunk per wakeup, gated by fill ceiling.
+    // Chunk size is in sender-cache frame units — codec-agnostic and DoP-safe.
+    uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+    size_t steadyChunkFrames = (rate > 0)
+        ? std::clamp(
+              static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
+              STEADY_CHUNK_MIN_FRAMES,
+              STEADY_CHUNK_MAX_FRAMES)
+        : STEADY_CHUNK_MIN_FRAMES;
+
+    if (direttaPtr->getBufferLevel() < STEADY_CEILING) {
         size_t contiguous = cacheContiguousFrames();
-        if (contiguous == 0) break;
-        size_t chunk = std::min(contiguous, frameCap - framesSent);
-        sendChunk(chunk);
-        framesSent += chunk;
+        if (contiguous > 0)
+            sendChunk(std::min(contiguous, steadyChunkFrames));
     }
 }
 ```
 
 **Properties**:
 - Hysteresis gap (enter=0.75, exit=0.40) prevents mode flap under Linux scheduling noise.
-- Steady cap uses `getFramesPerBuffer()` — matches the actual SDK drain quantum,
-  no dependence on sink packing format in `main.cpp`.
+- Steady ceiling (0.65) prevents ring creep without frame-count arithmetic.
+- Chunk duration ~2 ms across rates: 88 frames @ 44.1k, 192 @ 96k, 384 @ 192k — all
+  within the 128..512 clamp.
+- DoP-safe: `dopPcmRate` is the carrier PCM rate, which is already in sender-cache
+  frame units matching the SPSC ring.
 - Recovery mode retains fast catch-up for startup, post-stall, and rebuffer.
-- Automatic recovery re-entry when ring falls below 40%.
 - State transition is checked once per wakeup — no mid-burst mode changes.
+- No changes to `DirettaSync` required.
 
 ---
 
@@ -170,9 +193,8 @@ if (senderMode == SenderMode::kRecovery) {
 | File | Change |
 |------|--------|
 | `src/PcmDecoder.h` | Add `m_readPos`, `COMPACT_THRESHOLD` |
-| `src/PcmDecoder.cpp` | Replace `erase` with offset+conditional compact; adjust all pointer/size arithmetic |
+| `src/PcmDecoder.cpp` | Replace `erase` with offset+conditional compact; adjust all pointer/size arithmetic; reset `m_readPos` in `flush()` |
 | `src/main.cpp` | Adaptive HTTP read sizing in producer; two-mode sender state machine |
-| `diretta/DirettaSync.h` | Add `getFramesPerBuffer()` accessor |
 
 ---
 
@@ -182,3 +204,6 @@ if (senderMode == SenderMode::kRecovery) {
 - SPSC ring buffer or producer/sender thread structure.
 - DirettaSync internal drain path or SDK callback logic.
 - FLAC path — Fix 1 is PcmDecoder-only; Fix 2 is codec-agnostic by design.
+- `DirettaSync` — no changes required; the initial `getFramesPerBuffer()` accessor
+  design was rejected because `configureRingDSD()` does not update `m_sampleRate`
+  and because sink callback frame counts don't map to sender-cache frame units for DoP.
