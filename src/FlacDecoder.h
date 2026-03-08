@@ -64,9 +64,18 @@ private:
     size_t m_inputPos = 0;
     bool m_eof = false;
 
-    // Output buffer (filled by write callback)
+    // Output buffer (filled by write callback).
+    // m_outputPos is a persistent read offset — not reset after every copy.
+    // Compaction is deferred until OUTPUT_COMPACT_THRESHOLD_SAMPLES of consumed
+    // samples have accumulated and the move is worthwhile.
     std::vector<int32_t> m_outputBuffer;
     size_t m_outputPos = 0;
+
+    // Compaction thresholds — unit matches the buffer's element unit.
+    // Input threshold: bytes (m_inputBuffer is uint8_t).
+    // Output threshold: int32_t samples (m_outputBuffer is int32_t).
+    static constexpr size_t INPUT_COMPACT_THRESHOLD_BYTES    = 16384;
+    static constexpr size_t OUTPUT_COMPACT_THRESHOLD_SAMPLES = 16384;
 
     // Format from STREAMINFO metadata
     DecodedFormat m_format;

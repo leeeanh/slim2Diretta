@@ -20,6 +20,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <cstddef>
 
 FlacDecoder::FlacDecoder() {
     m_inputBuffer.reserve(131072);  // 128KB — enough for most metadata blocks
@@ -225,11 +226,18 @@ size_t FlacDecoder::readDecoded(int32_t* out, size_t maxFrames) {
 
     // Compact input buffer: only remove confirmed-consumed bytes.
     // Read-ahead bytes (between confirmed pos and m_inputPos) stay in the buffer.
+    // Invariant: confirmedBufPos <= m_inputPos <= m_inputBuffer.size().
+    // m_tellOffset advances only when bytes are physically erased — keep the
+    // three assignments together inside the gate.
     size_t confirmedBufPos = static_cast<size_t>(m_confirmedAbsolutePos - m_tellOffset);
-    if (confirmedBufPos > 0) {
+    size_t inputUnread = m_inputBuffer.size() - confirmedBufPos;
+    if (confirmedBufPos >= INPUT_COMPACT_THRESHOLD_BYTES &&
+        (confirmedBufPos >= m_inputBuffer.size() / 2 ||
+         inputUnread < INPUT_COMPACT_THRESHOLD_BYTES)) {
         m_inputBuffer.erase(m_inputBuffer.begin(),
-                            m_inputBuffer.begin() + confirmedBufPos);
-        m_inputPos -= confirmedBufPos;
+                            m_inputBuffer.begin() +
+                                static_cast<std::ptrdiff_t>(confirmedBufPos));
+        m_inputPos   -= confirmedBufPos;
         m_tellOffset += confirmedBufPos;
     }
 
@@ -245,13 +253,19 @@ size_t FlacDecoder::readDecoded(int32_t* out, size_t maxFrames) {
                     samplesToCopy * sizeof(int32_t));
         m_outputPos += samplesToCopy;
         m_decodedSamples += framesToCopy;
+    }
 
-        // Compact output buffer
-        if (m_outputPos > 0) {
-            m_outputBuffer.erase(m_outputBuffer.begin(),
-                                 m_outputBuffer.begin() + m_outputPos);
-            m_outputPos = 0;
-        }
+    // Compact output buffer only when the consumed prefix is large enough and
+    // reclaiming it is worthwhile: either the majority is consumed, or the
+    // remaining tail is itself below the threshold.
+    size_t outputUnread = m_outputBuffer.size() - m_outputPos;
+    if (m_outputPos >= OUTPUT_COMPACT_THRESHOLD_SAMPLES &&
+        (m_outputPos >= m_outputBuffer.size() / 2 ||
+         outputUnread < OUTPUT_COMPACT_THRESHOLD_SAMPLES)) {
+        m_outputBuffer.erase(m_outputBuffer.begin(),
+                             m_outputBuffer.begin() +
+                                 static_cast<std::ptrdiff_t>(m_outputPos));
+        m_outputPos = 0;
     }
 
     return framesToCopy;
