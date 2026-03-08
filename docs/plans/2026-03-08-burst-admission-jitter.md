@@ -151,12 +151,7 @@ Read `src/FlacDecoder.h` lines 60–101 and `src/FlacDecoder.cpp` lines 95–162
     unsigned m_metadataRetries = 0;  // Count of metadata incomplete retries
 ```
 
-**Add** three new members below `m_metadataDone` (line 94), and one new constant, and update the `m_maxBlocksize` capture:
-
-In the private constants block (near `INPUT_COMPACT_THRESHOLD_BYTES`), add:
-```cpp
-    static constexpr size_t FLAC_METADATA_PRESCAN_MAX_BYTES = 2 * 1024 * 1024;
-```
+**Add** two new members below `m_metadataDone` (line 94) and one after `m_shift`:
 
 In the members section, after `m_metadataDone`:
 ```cpp
@@ -234,9 +229,15 @@ with:
             size_t bufSize = m_inputBuffer.size();
 
             // Need at least the FLAC magic
-            if (bufSize < 4) return 0;
+            if (bufSize < 4) {
+                if (m_eof) {
+                    LOG_ERROR("[FLAC] Stream ended before FLAC signature");
+                    m_error = true;
+                }
+                return 0;
+            }
 
-            // Validate FLAC signature — fail immediately, don't wait
+            // Validate FLAC signature — fail immediately (don't wait for more bytes)
             if (std::memcmp(buf, "fLaC", 4) != 0) {
                 LOG_ERROR("[FLAC] Invalid FLAC signature: 0x"
                           << std::hex
@@ -248,32 +249,43 @@ with:
 
             size_t pos = 4;
             bool foundLast = false;
-            while (pos + 4 <= bufSize) {
+            while (true) {
+                if (pos + 4 > bufSize) {
+                    // Need block header bytes
+                    if (m_eof) {
+                        LOG_ERROR("[FLAC] Stream truncated in metadata block header");
+                        m_error = true;
+                    }
+                    return 0;
+                }
+
                 bool isLast  = (buf[pos] & 0x80) != 0;
                 size_t blockLen = (static_cast<size_t>(buf[pos + 1]) << 16)
                                 | (static_cast<size_t>(buf[pos + 2]) <<  8)
                                 |  static_cast<size_t>(buf[pos + 3]);
                 size_t blockEnd = pos + 4 + blockLen;
 
-                if (blockEnd > FLAC_METADATA_PRESCAN_MAX_BYTES) {
-                    LOG_ERROR("[FLAC] Metadata section exceeds prescan limit ("
-                              << FLAC_METADATA_PRESCAN_MAX_BYTES / 1024
-                              << " KB) — aborting stream");
-                    m_error = true;
+                if (blockEnd > bufSize) {
+                    // Need block body bytes — no byte-count cap, just wait
+                    if (m_eof) {
+                        LOG_ERROR("[FLAC] Stream truncated inside metadata block ("
+                                  << blockLen << " bytes expected, "
+                                  << (bufSize - pos - 4) << " available)");
+                        m_error = true;
+                    }
                     return 0;
                 }
 
                 pos = blockEnd;
 
                 if (isLast) {
-                    if (pos > bufSize) break;  // Last block boundary found but bytes not yet buffered
                     foundLast = true;
                     break;
                 }
             }
 
             if (!foundLast) {
-                // Not all metadata bytes buffered yet — wait silently
+                // Loop exited without finding last block — should not reach here
                 return 0;
             }
 

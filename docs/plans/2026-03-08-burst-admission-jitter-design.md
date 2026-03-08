@@ -101,28 +101,29 @@ The recreate-and-retry loop in the metadata phase is replaced by a byte-level pr
 gates `initDecoder()`. libFLAC is never constructed until all metadata bytes are confirmed
 present.
 
-### New constant
-
-```cpp
-static constexpr size_t FLAC_METADATA_PRESCAN_MAX_BYTES = 2 * 1024 * 1024;  // 2 MB cap
-```
-
 ### Pre-scan logic
 
 Runs on raw `m_inputBuffer` bytes before any libFLAC call. A new `m_metadataPrescanDone`
-bool replaces `m_metadataRetries` as the gate for the metadata phase.
+bool replaces `m_metadataRetries` as the gate for the metadata phase. No byte-count cap
+is applied — metadata section size is not bounded here because legitimate streams with
+large embedded cover art can exceed any reasonable fixed limit. Termination is driven
+solely by stream completion (all bytes arrived) or EOF (truncated/corrupt stream).
 
 ```
-1. if (m_inputBuffer.size() < 4)              → return 0 (wait for more data)
-2. if (memcmp(buf, "fLaC", 4) != 0)           → log error, set m_error, return 0
+1. if (m_inputBuffer.size() < 4 && !m_eof)   → return 0 (wait for more data)
+   if (m_inputBuffer.size() < 4 &&  m_eof)   → log error, set m_error, return 0
+2. if (memcmp(buf, "fLaC", 4) != 0)          → log error, set m_error, return 0
 3. pos = 4
 4. loop:
-     if (pos + 4 > m_inputBuffer.size())      → return 0 (wait, optional throttled debug log)
+     if (pos + 4 > m_inputBuffer.size())
+         !m_eof                               → return 0 (wait for header bytes)
+          m_eof                               → log "truncated metadata", set error, return 0
      last    = buf[pos] & 0x80
      blockLen = (buf[pos+1]<<16)|(buf[pos+2]<<8)|buf[pos+3]
      blockEnd = pos + 4 + blockLen
-     if (blockEnd > FLAC_METADATA_PRESCAN_MAX_BYTES)
-                                               → log "metadata exceeds prescan limit", set error, return 0
+     if (blockEnd > m_inputBuffer.size())
+         !m_eof                               → return 0 (wait for block body)
+          m_eof                               → log "truncated metadata block", set error, return 0
      pos = blockEnd
      if (last) → pre-scan complete, set m_metadataPrescanDone, proceed to init
 ```
