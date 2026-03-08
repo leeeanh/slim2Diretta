@@ -153,7 +153,7 @@ git commit -m "perf(pcm): replace vector::erase with read-offset in PcmDecoder"
 **Files:**
 - Modify: `src/PcmDecoder.cpp`
 
-**Context:** `flush()` resets all state for a new stream. `m_readPos` must also be reset here, or the offset will be stale on stream reinit. `setEof()` must NOT reset it — `setEof` is an end-of-input signal only and resets there would corrupt buffered unread data.
+**Context:** `flush()` resets all state for a new stream. `m_readPos` must also be reset here, or the offset will be stale on stream reinit. `setEof()` must NOT reset it — `setEof` is an end-of-input signal only; resetting there would corrupt buffered unread data.
 
 **Step 1: Add reset to flush() (around line 119)**
 
@@ -193,43 +193,7 @@ git commit -m "fix(pcm): reset m_readPos in flush() for stream reinit"
 
 ---
 
-### Task 4: DirettaSync — add getFramesPerBuffer() accessor
-
-**Files:**
-- Modify: `diretta/DirettaSync.h`
-
-**Context:** The sender state machine (Task 5) needs the SDK callback frame count to cap steady-state fills. `DirettaSync` computes this as `m_sampleRate / 1000` (base frames, integer division). Adding an accessor avoids leaking format knowledge into `main.cpp` and avoids any dependency on the remainder-accumulator used in the consumer path.
-
-**Step 1: Add the accessor near getBufferLevel() in DirettaSync.h**
-
-Find the `getBufferLevel()` declaration (currently line 394) and add immediately after it:
-
-```cpp
-// Returns base callback frame count (sampleRate / 1000).
-// Does not include remainder-accumulator adjustment — base count is
-// sufficient and stable for sender pacing.
-size_t getFramesPerBuffer() const {
-    return static_cast<size_t>(
-        m_sampleRate.load(std::memory_order_relaxed)) / 1000;
-}
-```
-
-**Step 2: Build**
-
-```bash
-cd build && make 2>&1 | head -20
-```
-
-**Step 3: Commit**
-
-```bash
-git add diretta/DirettaSync.h
-git commit -m "feat(diretta): add getFramesPerBuffer() accessor for sender pacing"
-```
-
----
-
-### Task 5: main.cpp — adaptive HTTP read sizing in producer
+### Task 4: main.cpp — adaptive HTTP read sizing in producer
 
 **Files:**
 - Modify: `src/main.cpp`
@@ -263,7 +227,9 @@ ssize_t n = httpStream->readWithTimeout(httpBuf, sizeof(httpBuf), 2);
 
 Replace with:
 ```cpp
-// Adaptive read size: burst during prebuffer, cache-pressure-banded in steady state
+// Adaptive read size: burst during prebuffer, cache-pressure-banded in steady state.
+// fillRatio: 0 = cache empty (needs data), 1 = cache full (back off).
+// Codec-agnostic: uses decoded-frame occupancy, not source byte estimates.
 size_t readSize;
 if (!prebufferReady.load(std::memory_order_relaxed)) {
     readSize = HTTP_READ_BURST;
@@ -301,27 +267,56 @@ git commit -m "perf(audio): adaptive HTTP read sizing based on cache fill ratio"
 
 ---
 
-### Task 6: main.cpp — two-mode sender refill state machine
+### Task 5: main.cpp — two-mode sender refill state machine
 
 **Files:**
 - Modify: `src/main.cpp`
 
-**Context:** The sender loop currently fills to 95% on every wakeup. After this task it uses a `SenderMode` enum with two states: `kRecovery` (aggressive fill) and `kSteady` (callback-paced fill), with hysteresis watermarks to prevent mode flap.
+**Context:** The sender loop currently fills to 95% on every wakeup. After this task it uses a `SenderMode` enum with two states — `kRecovery` (aggressive fill) and `kSteady` (level-ceiling single-chunk fill) — with hysteresis watermarks to prevent mode flap.
 
-**Step 1: Add the SenderMode enum and watermark constants near the sender thread definition**
+**Why level-ceiling instead of frame-count cap:**
+The sender cache operates in source-format frame units. For DoP, each source frame is
+expanded 16× inside `sendAudio()`, so sink callback frame counts don't map cleanly to
+sender frames. The level-ceiling approach avoids this entirely: it asks "is the ring
+below target?" rather than "how many sink frames should I send?" The chunk size is
+derived from the sender's own rate (`dopPcmRate` for DoP, `snapshotSampleRate` for
+PCM) — no DirettaSync format knowledge required.
 
-Find the sender thread lambda declaration (around `std::thread senderThread([&]() {`). Just before the lambda body's first statement, add:
+**Step 1: Locate the sender rate**
+
+In the sender lambda, the correct rate for chunk sizing is already available. Identify
+these variables (set by the producer before `audioFmtReady`, read by sender after):
+
+```cpp
+// Already declared in outer scope, captured by reference:
+bool     dopDetected;       // true if DoP stream detected
+uint32_t dopPcmRate;        // carrier PCM rate for DoP (sender-frame rate)
+uint32_t snapshotSampleRate; // PCM sample rate for non-DoP
+```
+
+The sender rate in sender-cache frame units is:
+```cpp
+uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+```
+
+**Step 2: Add constants and the SenderMode enum near the sender thread definition**
+
+Find the sender thread lambda (around `std::thread senderThread([&]() {`). Just before
+the lambda body's first statement, add:
 
 ```cpp
 enum class SenderMode { kRecovery, kSteady };
-constexpr float RECOVERY_TARGET = 0.90f;  // fill to here in recovery mode
-constexpr float STEADY_ENTER    = 0.75f;  // enter steady once ring is above this
-constexpr float STEADY_EXIT     = 0.40f;  // drop back to recovery below this
-constexpr int   STEADY_CHUNKS_PER_WAKEUP = 2;
+constexpr float  RECOVERY_TARGET         = 0.90f;  // fill to here in recovery
+constexpr float  STEADY_ENTER            = 0.75f;  // switch to steady above this
+constexpr float  STEADY_EXIT             = 0.40f;  // drop back to recovery below this
+constexpr float  STEADY_CEILING          = 0.65f;  // max fill in steady mode
+constexpr float  STEADY_CHUNK_MS         = 2.0f;   // target chunk duration
+constexpr size_t STEADY_CHUNK_MIN_FRAMES = 128;
+constexpr size_t STEADY_CHUNK_MAX_FRAMES = 512;
 SenderMode senderMode = SenderMode::kRecovery;
 ```
 
-**Step 2: Replace the inner fill loop in the main sender while-loop**
+**Step 3: Replace the inner fill loop in the main sender while-loop**
 
 Find this existing block (lines ~1228-1234):
 ```cpp
@@ -336,7 +331,9 @@ while (audioTestRunning.load(std::memory_order_relaxed) &&
 
 Replace entirely with:
 ```cpp
-// State transition — once per wakeup, outside all fill loops
+// State transition — once per wakeup, outside all fill loops.
+// Hysteresis gap (STEADY_ENTER vs STEADY_EXIT) prevents mode flap
+// under Linux scheduling noise.
 float level = direttaPtr->getBufferLevel();
 if (senderMode == SenderMode::kRecovery && level >= STEADY_ENTER)
     senderMode = SenderMode::kSteady;
@@ -344,7 +341,8 @@ else if (senderMode == SenderMode::kSteady && level < STEADY_EXIT)
     senderMode = SenderMode::kRecovery;
 
 if (senderMode == SenderMode::kRecovery) {
-    // Aggressive fill: run up to RECOVERY_TARGET
+    // Aggressive fill: run up to RECOVERY_TARGET.
+    // Used during startup, prebuffer, and after stalls/seeks.
     while (audioTestRunning.load(std::memory_order_relaxed) &&
            direttaPtr->getBufferLevel() < RECOVERY_TARGET) {
         size_t contiguous = cacheContiguousFrames();
@@ -352,27 +350,34 @@ if (senderMode == SenderMode::kRecovery) {
         sendChunk(std::min(contiguous, MAX_DECODE_FRAMES));
     }
 } else {
-    // Steady: cap each wakeup to STEADY_CHUNKS_PER_WAKEUP callback-sized chunks
-    size_t frameCap = STEADY_CHUNKS_PER_WAKEUP * direttaPtr->getFramesPerBuffer();
-    size_t framesSent = 0;
-    while (audioTestRunning.load(std::memory_order_relaxed) &&
-           framesSent < frameCap) {
+    // Steady: one rate-derived chunk per wakeup, gated by fill ceiling.
+    // Chunk size in sender-cache frame units (codec-agnostic, DoP-safe):
+    //   - uses dopPcmRate for DoP (carrier frame rate matches cache units)
+    //   - uses snapshotSampleRate for PCM
+    // Ceiling prevents ring creep without needing sink-side frame counts.
+    uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+    size_t steadyChunkFrames = (rate > 0)
+        ? std::clamp(
+              static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
+              STEADY_CHUNK_MIN_FRAMES,
+              STEADY_CHUNK_MAX_FRAMES)
+        : STEADY_CHUNK_MIN_FRAMES;
+
+    if (direttaPtr->getBufferLevel() < STEADY_CEILING) {
         size_t contiguous = cacheContiguousFrames();
-        if (contiguous == 0) break;
-        size_t chunk = std::min(contiguous, frameCap - framesSent);
-        sendChunk(chunk);
-        framesSent += chunk;
+        if (contiguous > 0)
+            sendChunk(std::min(contiguous, steadyChunkFrames));
     }
 }
 ```
 
-**Step 3: Build**
+**Step 4: Build**
 
 ```bash
 cd build && make 2>&1 | head -30
 ```
 
-**Step 4: Manual test — full playback**
+**Step 5: Manual test — full playback**
 
 ```bash
 sudo ./slim2diretta -s <lms-ip> --target 1 -v
@@ -381,16 +386,17 @@ sudo ./slim2diretta -s <lms-ip> --target 1 -v
 Verify:
 - Track starts cleanly (kRecovery fills ring before steady-state engagement)
 - Playback runs without audible glitches or underruns
-- Track transitions work (new track starts in kRecovery, transitions to kSteady)
+- Track transitions work (new track re-enters kRecovery, transitions to kSteady)
 - Log does not show excessive mode switching during steady playback
 
-**Step 5: Test edge cases**
+**Step 6: Test edge cases**
 
-- Pause and resume: verify kRecovery re-engages on resume if ring drained below STEADY_EXIT
-- Seek: verify kRecovery handles the rebuffer after seek
-- DSD/high-rate content (if available): 192 kHz has `getFramesPerBuffer()` = 192, so `frameCap` = 384 frames — verify it tracks correctly
+- **Pause and resume**: verify kRecovery re-engages on resume if ring drained below STEADY_EXIT (0.40)
+- **Seek**: verify kRecovery handles the rebuffer after seek
+- **DoP stream** (if available): verify `dopPcmRate` is used and playback is stable
+- **High sample rate** (96/192 kHz): `rate * 2.0 / 1000` → 192 frames at 96k, 384 at 192k — both within 128..512 clamp
 
-**Step 6: Commit**
+**Step 7: Commit**
 
 ```bash
 git add src/main.cpp
@@ -407,6 +413,7 @@ After all tasks complete, run through this sequence:
 2. **AIFF playback** — same verification
 3. **FLAC playback** — producer adaptive sizing is codec-agnostic; verify no regression
 4. **Track change** — `flush()` resets `m_readPos`; verify second track plays correctly
-5. **High sample rate** (88.2/96/192 kHz) — `getFramesPerBuffer()` returns correct base count
+5. **High sample rate** (88.2/96/192 kHz) — chunk size clamps within 128..512; verify stable
 6. **Pause/resume** — sender re-enters kRecovery, no underrun
-7. **Build clean** — `make` from fresh `build/` with no warnings on changed files
+7. **DoP** (if available) — `dopPcmRate` used for chunk sizing; verify stable
+8. **Build clean** — `make` from fresh `build/` with no warnings on changed files
