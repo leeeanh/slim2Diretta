@@ -27,6 +27,16 @@ static uint32_t readBE32(const uint8_t* p) {
     return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
 }
 
+// Compute a format-aware reserve size for m_dataBuf.
+// ~250ms of raw PCM, rounded to 64KB, clamped to [128KB, 512KB].
+// Only grows, never shrinks — caller must check capacity first.
+static size_t pcmDataBufReserve(uint32_t bytesPerFrame, uint32_t sampleRate) {
+    if (bytesPerFrame == 0 || sampleRate == 0) return 128 * 1024;
+    size_t target = static_cast<size_t>(bytesPerFrame) * sampleRate / 4;
+    target = (target + 65535u) & ~65535u;  // round up to 64KB
+    return std::clamp(target, size_t(128 * 1024), size_t(512 * 1024));
+}
+
 PcmDecoder::PcmDecoder() {
     m_headerBuf.reserve(256);
     m_dataBuf.reserve(32768);
@@ -160,6 +170,13 @@ bool PcmDecoder::detectContainer() {
     if (m_rawPcmConfigured) {
         m_formatReady = true;
         m_dataRemaining = 0;  // Unlimited (stream until EOF)
+
+        {
+            uint32_t bytesPerFrame = (m_format.bitDepth / 8) * m_format.channels;
+            size_t target = pcmDataBufReserve(bytesPerFrame, m_format.sampleRate);
+            if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
+        }
+
         // Move all accumulated data to data buffer (it's audio, not a header)
         m_dataBuf.insert(m_dataBuf.end(), m_headerBuf.begin(), m_headerBuf.end());
         m_headerBuf.clear();
@@ -196,6 +213,7 @@ bool PcmDecoder::parseWavHeader() {
     bool foundFmt = false;
     bool foundData = false;
     size_t dataStart = 0;
+    uint16_t containerBitsPerSample = 0;
 
     while (pos + 8 <= m_headerBuf.size()) {
         uint32_t chunkSize = readLE32(p + pos + 4);
@@ -228,6 +246,7 @@ bool PcmDecoder::parseWavHeader() {
             m_format.channels = readLE16(p + pos + 10);
             m_format.sampleRate = readLE32(p + pos + 12);
             m_format.bitDepth = readLE16(p + pos + 22);
+            containerBitsPerSample = static_cast<uint16_t>(m_format.bitDepth);
 
             // EXTENSIBLE: wValidBitsPerSample may differ from container size
             if (isExtensible) {
@@ -262,6 +281,12 @@ bool PcmDecoder::parseWavHeader() {
 
     LOG_INFO("[PCM] WAV: " << m_format.sampleRate << " Hz, "
              << m_format.bitDepth << "-bit, " << m_format.channels << " ch");
+
+    {
+        uint32_t containerBytesPerFrame = (containerBitsPerSample / 8) * m_format.channels;
+        size_t target = pcmDataBufReserve(containerBytesPerFrame, m_format.sampleRate);
+        if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
+    }
 
     // Move remaining header bytes (after data chunk start) to data buffer
     if (dataStart < m_headerBuf.size()) {
@@ -331,6 +356,12 @@ bool PcmDecoder::parseAiffHeader() {
 
     LOG_INFO("[PCM] AIFF: " << m_format.sampleRate << " Hz, "
              << m_format.bitDepth << "-bit, " << m_format.channels << " ch");
+
+    {
+        uint32_t bytesPerFrame = (m_format.bitDepth / 8) * m_format.channels;
+        size_t target = pcmDataBufReserve(bytesPerFrame, m_format.sampleRate);
+        if (m_dataBuf.capacity() < target) m_dataBuf.reserve(target);
+    }
 
     // Move remaining data to data buffer
     if (dataStart < m_headerBuf.size()) {

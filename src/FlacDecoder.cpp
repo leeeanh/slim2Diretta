@@ -87,79 +87,131 @@ size_t FlacDecoder::readDecoded(int32_t* out, size_t maxFrames) {
     // Phase 1: Process all metadata blocks
     // ================================================================
     // FLAC files can have large metadata (album art = 100KB+).
-    // If ABORT happens during metadata (not enough data), we delete
-    // the decoder entirely and recreate it on the next call with more
-    // accumulated data. The input buffer is NOT compacted during this
-    // phase, so all previously fed data is available for the retry.
+    // We pre-scan raw bytes and call libFLAC metadata processing only
+    // once when all metadata bytes are confirmed in-buffer.
 
     if (!m_metadataDone) {
-        size_t savedPos = m_inputPos;
+        // ---------------------------------------------------------------
+        // Pre-scan: confirm all metadata bytes are present before calling
+        // libFLAC. Seek/mid-stream restarts (no fLaC magic) skip the
+        // metadata phase entirely; libFLAC resyncs via LOST_SYNC.
+        // ---------------------------------------------------------------
+        if (!m_metadataPrescanDone) {
+            const uint8_t* buf = m_inputBuffer.data();
+            size_t bufSize = m_inputBuffer.size();
 
-        if (!FLAC__stream_decoder_process_until_end_of_metadata(m_decoder)) {
-            FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(m_decoder);
-
-            if (state == FLAC__STREAM_DECODER_ABORTED) {
-                // Not enough data for all metadata — need more input
-                m_inputPos = savedPos;  // Rollback: keep all data
-                FLAC__stream_decoder_delete(m_decoder);
-                m_decoder = nullptr;
-                m_initialized = false;
-                m_metadataRetries++;
-                // Log first attempt and then only every 50th to avoid spam
-                // (Qobuz streams with large album art can need 100+ retries)
-                if (m_metadataRetries == 1) {
-                    LOG_DEBUG("[FLAC] Metadata incomplete, need more data ("
-                              << m_inputBuffer.size() << " bytes buffered)");
-                } else if (m_metadataRetries % 50 == 0) {
-                    LOG_DEBUG("[FLAC] Metadata still incomplete after "
-                              << m_metadataRetries << " retries ("
-                              << m_inputBuffer.size() << " bytes buffered)");
+            if (bufSize < 4) {
+                if (m_eof) {
+                    LOG_ERROR("[FLAC] Stream ended before FLAC signature");
+                    m_error = true;
                 }
                 return 0;
             }
 
-            if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
-                m_finished = true;
+            if (std::memcmp(buf, "fLaC", 4) != 0) {
+                // Seek/mid-stream start: skip metadata, decode from first frame.
+                LOG_DEBUG("[FLAC] No fLaC magic — seek/mid-stream start, skipping metadata phase");
+                m_metadataPrescanDone = true;
+                m_metadataDone = true;
+                // inner if (!m_metadataDone) below is skipped; falls through to Phase 2.
+            } else {
+                // Full FLAC stream: scan block headers until last-metadata bit.
+                size_t pos = 4;
+                bool foundLast = false;
+                while (true) {
+                    if (pos + 4 > bufSize) {
+                        if (m_eof) {
+                            LOG_ERROR("[FLAC] Stream truncated in metadata block header");
+                            m_error = true;
+                        }
+                        return 0;
+                    }
+
+                    bool isLast = (buf[pos] & 0x80) != 0;
+                    size_t blockLen = (static_cast<size_t>(buf[pos + 1]) << 16) |
+                                      (static_cast<size_t>(buf[pos + 2]) << 8) |
+                                      static_cast<size_t>(buf[pos + 3]);
+                    size_t blockEnd = pos + 4 + blockLen;
+                    if (blockEnd > FLAC_METADATA_PRESCAN_MAX_BYTES) {
+                        LOG_ERROR("[FLAC] Metadata section exceeds "
+                                  << FLAC_METADATA_PRESCAN_MAX_BYTES
+                                  << " bytes hard cap");
+                        m_error = true;
+                        return 0;
+                    }
+                    if (blockEnd > bufSize) {
+                        if (m_eof) {
+                            LOG_ERROR("[FLAC] Stream truncated inside metadata block ("
+                                      << blockLen << " bytes expected, "
+                                      << (bufSize - pos - 4) << " available)");
+                            m_error = true;
+                        }
+                        return 0;
+                    }
+
+                    pos = blockEnd;
+                    if (isLast) {
+                        foundLast = true;
+                        break;
+                    }
+                }
+
+                if (!foundLast) return 0;
+
+                m_metadataPrescanDone = true;
+                LOG_DEBUG("[FLAC] Pre-scan complete: " << pos << " metadata bytes confirmed ("
+                          << bufSize << " buffered)");
+            }
+        }  // end if (!m_metadataPrescanDone)
+
+        // For full FLAC streams: process metadata exactly once.
+        // Seek streams set m_metadataDone = true above, so this block is skipped.
+        if (!m_metadataDone) {
+            if (!FLAC__stream_decoder_process_until_end_of_metadata(m_decoder)) {
+                FLAC__StreamDecoderState state = FLAC__stream_decoder_get_state(m_decoder);
+                if (state == FLAC__STREAM_DECODER_END_OF_STREAM) {
+                    m_finished = true;
+                    return 0;
+                }
+                // Pre-scan confirmed bytes present; ABORT here means corruption
+                LOG_ERROR("[FLAC] Metadata processing failed after pre-scan (state="
+                          << FLAC__StreamDecoderStateString[state]
+                          << ") — stream likely corrupt");
+                m_error = true;
                 return 0;
             }
 
-            LOG_ERROR("[FLAC] Metadata processing failed: "
-                      << FLAC__StreamDecoderStateString[state]);
-            m_error = true;
-            return 0;
-        }
-
-        m_metadataDone = true;
-        if (m_metadataRetries > 0) {
-            LOG_DEBUG("[FLAC] Metadata complete after " << m_metadataRetries
-                      << " retries (" << m_inputBuffer.size() << " bytes buffered)");
-        } else {
+            m_metadataDone = true;
             LOG_DEBUG("[FLAC] Metadata complete, starting audio decode");
-        }
 
-        // Use get_decode_position to find exact metadata/audio boundary.
-        // This excludes read-ahead bytes in libFLAC's internal buffer,
-        // so those bytes stay in our buffer for the audio phase.
-        FLAC__uint64 absPos;
-        if (FLAC__stream_decoder_get_decode_position(m_decoder, &absPos)) {
-            size_t audioStart = static_cast<size_t>(absPos - m_tellOffset);
-            if (audioStart > 0 && audioStart <= m_inputBuffer.size()) {
-                m_inputBuffer.erase(m_inputBuffer.begin(),
-                                    m_inputBuffer.begin() + audioStart);
-                m_inputPos -= audioStart;
-                m_tellOffset += audioStart;
+            // Reserve output buffer from STREAMINFO max_blocksize (if available)
+            if (m_maxBlocksize > 0 && m_format.channels > 0) {
+                size_t target = static_cast<size_t>(m_maxBlocksize) * m_format.channels * 4;
+                if (m_outputBuffer.capacity() < target) m_outputBuffer.reserve(target);
+                m_outputReserved = true;
             }
-        } else {
-            // Fallback: compact to m_inputPos (may lose read-ahead on first ABORT)
-            if (m_inputPos > 0) {
-                m_tellOffset += m_inputPos;
-                m_inputBuffer.erase(m_inputBuffer.begin(),
-                                    m_inputBuffer.begin() + m_inputPos);
-                m_inputPos = 0;
+
+            // Compact metadata bytes: use get_decode_position to find exact audio boundary
+            FLAC__uint64 absPos;
+            if (FLAC__stream_decoder_get_decode_position(m_decoder, &absPos)) {
+                size_t audioStart = static_cast<size_t>(absPos - m_tellOffset);
+                if (audioStart > 0 && audioStart <= m_inputBuffer.size()) {
+                    m_inputBuffer.erase(m_inputBuffer.begin(),
+                                        m_inputBuffer.begin() + audioStart);
+                    m_inputPos -= audioStart;
+                    m_tellOffset += audioStart;
+                }
+            } else {
+                if (m_inputPos > 0) {
+                    m_tellOffset += m_inputPos;
+                    m_inputBuffer.erase(m_inputBuffer.begin(),
+                                        m_inputBuffer.begin() + m_inputPos);
+                    m_inputPos = 0;
+                }
             }
+            m_confirmedAbsolutePos = m_tellOffset;
         }
-        m_confirmedAbsolutePos = m_tellOffset;
-    }
+    }  // end if (!m_metadataDone)
 
     // ================================================================
     // Phase 2: Decode audio frames
@@ -283,15 +335,17 @@ void FlacDecoder::flush() {
     m_format = {};
     m_formatReady = false;
     m_shift = 0;
+    m_maxBlocksize = 0;
+    m_outputReserved = false;
     m_tellOffset = 0;
     m_confirmedAbsolutePos = 0;
     m_initialized = false;
     m_metadataDone = false;
+    m_metadataPrescanDone = false;
     m_error = false;
     m_finished = false;
     m_eof = false;
     m_decodedSamples = 0;
-    m_metadataRetries = 0;
 }
 
 // ============================================
@@ -345,6 +399,15 @@ FLAC__StreamDecoderWriteStatus FlacDecoder::writeCallback(
                  << channels << " ch");
     }
 
+    // First-frame fallback reserve (only fires when STREAMINFO had no max_blocksize)
+    if (!self->m_outputReserved) {
+        size_t target = std::min(
+            static_cast<size_t>(blocksize) * channels * 4,
+            size_t(65536));
+        if (self->m_outputBuffer.capacity() < target) self->m_outputBuffer.reserve(target);
+        self->m_outputReserved = true;
+    }
+
     int shift = self->m_shift;
 
     // Reserve space for interleaved output
@@ -374,6 +437,7 @@ void FlacDecoder::metadataCallback(
         self->m_format.bitDepth = info.bits_per_sample;
         self->m_format.channels = info.channels;
         self->m_format.totalSamples = info.total_samples;
+        self->m_maxBlocksize = info.max_blocksize;
 
         self->m_shift = 32 - static_cast<int>(info.bits_per_sample);
         self->m_formatReady = true;

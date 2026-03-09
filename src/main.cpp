@@ -1110,13 +1110,17 @@ int main(int argc, char* argv[]) {
                     });
 
                     enum class SenderMode { kRecovery, kSteady };
-                    constexpr float  RECOVERY_TARGET         = 0.90f;
-                    constexpr float  STEADY_ENTER            = 0.75f;
-                    constexpr float  STEADY_EXIT             = 0.40f;
-                    constexpr float  STEADY_CEILING          = 0.65f;
-                    constexpr float  STEADY_CHUNK_MS         = 2.0f;
-                    constexpr size_t STEADY_CHUNK_MIN_FRAMES = 128;
-                    constexpr size_t STEADY_CHUNK_MAX_FRAMES = 512;
+                    constexpr float  STEADY_ENTER              = 0.75f;
+                    constexpr float  STEADY_EXIT               = 0.40f;
+                    constexpr float  STEADY_CEILING            = 0.65f;
+                    constexpr float  STEADY_CHUNK_MS           = 2.0f;
+                    constexpr size_t STEADY_CHUNK_MIN_FRAMES   = 128;
+                    constexpr size_t STEADY_CHUNK_MAX_FRAMES   = 512;
+                    constexpr float  DEEP_RECOVERY_THRESHOLD   = 0.20f;
+                    constexpr float  RECOVERY_CHUNK_MS         = 5.0f;
+                    constexpr float  DEEP_RECOVERY_CHUNK_MS    = 10.0f;
+                    constexpr size_t RECOVERY_CHUNK_MIN_FRAMES = 128;
+                    constexpr size_t RECOVERY_CHUNK_MAX_FRAMES = 1024;
                     SenderMode senderMode = SenderMode::kRecovery;
 
                     std::thread senderThread([&]() {
@@ -1266,12 +1270,17 @@ int main(int argc, char* argv[]) {
                             }
 
                             if (senderMode == SenderMode::kRecovery) {
-                                while (audioTestRunning.load(std::memory_order_relaxed) &&
-                                       direttaPtr->getBufferLevel() < RECOVERY_TARGET) {
-                                    size_t contiguous = cacheContiguousFrames();
-                                    if (contiguous == 0) break;
-                                    sendChunk(std::min(contiguous, MAX_DECODE_FRAMES));
-                                }
+                                // level was already sampled for the mode transition — reuse it.
+                                float chunkMs = (level < DEEP_RECOVERY_THRESHOLD)
+                                    ? DEEP_RECOVERY_CHUNK_MS : RECOVERY_CHUNK_MS;
+                                size_t chunkFrames = (rate > 0)
+                                    ? std::clamp(
+                                          static_cast<size_t>(rate * chunkMs / 1000.0f),
+                                          RECOVERY_CHUNK_MIN_FRAMES,
+                                          RECOVERY_CHUNK_MAX_FRAMES)
+                                    : RECOVERY_CHUNK_MIN_FRAMES;
+                                size_t contiguous = cacheContiguousFrames();
+                                if (contiguous > 0) sendChunk(std::min(contiguous, chunkFrames));
                             } else {
                                 uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
                                 size_t steadyChunkFrames = (rate > 0)

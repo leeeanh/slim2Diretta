@@ -7,7 +7,7 @@
  * - readDecoded() pulls decoded S32_LE interleaved samples
  *
  * Handles streaming with incomplete data:
- * - During metadata: ABORT → reset() (back to SEARCH_FOR_METADATA)
+ * - During metadata: byte-level pre-scan gates init; seek streams skip phase entirely
  * - During audio: ABORT → flush() (back to SEARCH_FOR_FRAME_SYNC)
  */
 
@@ -76,11 +76,14 @@ private:
     // Output threshold: int32_t samples (m_outputBuffer is int32_t).
     static constexpr size_t INPUT_COMPACT_THRESHOLD_BYTES    = 16384;
     static constexpr size_t OUTPUT_COMPACT_THRESHOLD_SAMPLES = 16384;
+    static constexpr size_t FLAC_METADATA_PRESCAN_MAX_BYTES  = 2 * 1024 * 1024;
 
     // Format from STREAMINFO metadata
     DecodedFormat m_format;
     bool m_formatReady = false;
     int m_shift = 0;  // Left shift for MSB alignment (32 - bitDepth)
+    uint32_t m_maxBlocksize = 0;  // From STREAMINFO; 0 if not yet seen
+    bool m_outputReserved = false;   // True once output buffer has been pre-reserved
 
     // Stream position tracking for accurate rollback on ABORT
     // libFLAC reads ahead into an internal buffer. On flush(), those bytes
@@ -92,10 +95,11 @@ private:
     // State
     bool m_initialized = false;
     bool m_metadataDone = false;
+    bool m_metadataPrescanDone = false;  // Pre-scan confirmed all metadata bytes present
+                                         // (or stream confirmed as seek/mid-frame start)
     bool m_error = false;
     bool m_finished = false;
     uint64_t m_decodedSamples = 0;
-    unsigned m_metadataRetries = 0;  // Count of metadata incomplete retries
 };
 
 #endif // SLIM2DIRETTA_FLAC_DECODER_H
