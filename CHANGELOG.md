@@ -2,6 +2,61 @@
 
 All notable changes to slim2diretta are documented in this file.
 
+## v1.2.0 (2026-03-12)
+
+### Added
+
+- **FFmpeg decoder backend** (`--decoder ffmpeg`): Alternative audio decoder using FFmpeg's libavcodec. Users can switch between the native backend (libFLAC/libmpg123/libvorbis) and FFmpeg for a different sonic signature. The native backend offers a brighter, more detailed sound; FFmpeg provides a warmer, more enveloping presentation with a wider soundstage. Both are lossless and theoretically bit-identical — the perceived difference likely stems from internal processing patterns (memory allocation, frame buffering, decode timing).
+  - Parser-based architecture (no avformat needed) — lightweight, only libavcodec + libavutil
+  - Supports FLAC, MP3, AAC, OGG, ALAC, PCM via a single unified decoder
+  - DSD remains handled natively (raw bitstream, not decoded)
+  - Selectable via CLI (`--decoder ffmpeg`) or Web UI (Decoder Backend dropdown)
+  - Build-time optional: auto-detected, graceful fallback to native if FFmpeg not installed
+
+- **Startup codec listing**: Build capabilities now show all available codecs and FFmpeg availability at startup
+
+### Fixed
+
+- **DSD64 DoP playback**: Fixed continuous ~485 Hz whistle tone when playing DSD64 via Roon (DoP). DoP frames are now passed through as 24-bit PCM to the Diretta Target, which handles DoP marker detection and DAC forwarding natively. Previously, `convertDopToNative()` destroyed the DoP markers causing frame misalignment. This matches the working behavior of squeeze2upnp→DirettaRendererUPnP. (Credit: hoorna, PR #4)
+
+### Build Dependencies
+
+New optional dependency for FFmpeg backend:
+
+| Distribution | Command |
+|-------------|---------|
+| **Fedora** | `sudo dnf install ffmpeg-free-devel` |
+| **Ubuntu/Debian** | `sudo apt install libavcodec-dev libavutil-dev` |
+| **Arch** | `sudo pacman -S ffmpeg` |
+
+To disable FFmpeg backend: `cmake -DENABLE_FFMPEG=OFF ..`
+
+---
+
+## v1.1.1 (2026-03-11) — internal release, not published
+
+### Fixed
+
+- **Seek causes track skip with Roon**: When seeking within a track, Roon (Squeezebox mode) would skip to the next track instead of seeking. The audio thread was sending STMu (track ended) on forced stop (`strm-q`), which Roon interpreted as the new stream ending. Now STMu is only sent on natural end-of-track (HTTP EOF). LMS tolerated the spurious STMu; Roon's stricter state machine did not.
+
+- **High sample rate buffer underruns (>192kHz)**: Adaptive buffer sizing for sample rates above 192kHz (352.8kHz, 384kHz, 768kHz, 1536kHz). LMS streams at ~1x real-time at these rates, leaving no margin with the previous 0.5s ring buffer. New behavior:
+  - Ring buffer: 0.5s → 2.0s for rates >192kHz
+  - Prebuffer: 500ms → 1500ms for rates >192kHz
+  - SDK prefill: 1000-1500ms for rates >192kHz (vs 100-200ms)
+  - MAX_BUFFER raised to 32MB (accommodates 1536kHz/32bit/2ch @ 2s)
+  - Decode cache raised to 9.2M samples (~3s at 1536kHz stereo)
+  - No change for rates ≤192kHz (identical behavior to v1.1.0)
+
+- **FLAC metadata log spam**: FLAC format information was logged repeatedly (dozens of times) for tracks with large metadata blocks (album art). The STREAMINFO callback was re-triggered on each metadata retry. Now logged only once per track.
+
+- **Player name with spaces ignored (webui)**: When the player name contained spaces (e.g. "Devialet Target"), the startup script lost the quoting and the second word became an unknown option. Fixed with `eval exec` to preserve quoted arguments from `SLIM2DIRETTA_OPTS`.
+
+### Added
+
+- **Build capabilities log at startup**: Displays architecture (x86_64/aarch64/arm) and SIMD support (AVX2/NEON/scalar) for easier remote diagnostics
+
+---
+
 ## v1.1.0 (2026-03-06)
 
 ### Added

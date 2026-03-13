@@ -1,4 +1,4 @@
-# slim2diretta v1.1.0
+# slim2diretta v1.2.0
 
 **Native LMS Player with Diretta Output - Mono-Process Architecture**
 
@@ -8,7 +8,7 @@
 
 ---
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)
 ![DSD](https://img.shields.io/badge/DSD-Native-green.svg)
 ![SDK](https://img.shields.io/badge/SDK-DIRETTA::Sync-orange.svg)
 
@@ -62,7 +62,7 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 ### Why Use This?
 
 - **Simplified setup**: Single binary, no Squeezelite to patch and compile
-- **Native DSD playback**: DSF, DFF, and DoP (Roon) to native DSD
+- **Native DSD playback**: DSF, DFF, and DoP passthrough (Roon compatibility)
 - **Bit-perfect streaming**: Bypasses OS audio stack entirely
 - **High-resolution PCM**: Up to 1536kHz/32-bit
 - **Low latency**: DirettaSync v2.0 with lock-free ring buffers and SIMD
@@ -102,6 +102,10 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 |  | - PCM/WAV/AIFF    |                                     |
 |  | - DSD (DSF/DFF)   |                                     |
 |  | - DoP detection   |                                     |
+|  |                   |                                     |
+|  | FFmpeg backend:   |                                     |
+|  | - --decoder ffmpeg|                                     |
+|  | - libavcodec      |                                     |
 |  +-------------------+                                     |
 +--------------------------------------------+---------------+
                                              |
@@ -131,12 +135,18 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 - **PCM**: WAV, AIFF containers + raw PCM (Roon)
 - **Native DSD**: DSF (LSB-first) and DFF/DSDIFF (MSB-first)
 - **DSD rates**: DSD64, DSD128, DSD256, DSD512, DSD1024
-- **DoP**: Automatic detection and conversion to native DSD (Roon compatibility)
+- **DoP**: Automatic detection and passthrough as 24-bit PCM (Roon compatibility). The Diretta Target handles DoP marker detection and forwarding to the DAC
 - **Bit-perfect**: Volume forced to 100%, no processing
+
+### Decoder Backends
+- **Native** (default): Dedicated libraries (libFLAC, libmpg123, libvorbis, fdk-aac) — brighter, more detailed sound
+- **FFmpeg** (`--decoder ffmpeg`): Unified decoder via libavcodec — warmer, wider soundstage
+
+Both backends produce lossless output. The sonic difference is subtle and stems from internal processing patterns. Switch between them to find your preference.
 
 ### DSD Handling
 - **Native DSD streaming**: Direct DSD bitstream from LMS (format code `d`)
-- **DoP auto-detection**: Transparent conversion from PCM-wrapped DSD (Roon)
+- **DoP auto-detection**: Passthrough as 24-bit PCM to Diretta Target (Roon)
 - **Container parsing**: DSF and DFF headers parsed in-stream
 - **Dynamic conversion**: Planar, bit-reverse, byte-swap as needed by DAC
 - **All rates**: DSD64 (2.8MHz) to DSD1024 (45.2MHz)
@@ -148,7 +158,8 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 ### Low-Latency Architecture
 - **DirettaSync v2.0**: Shared with squeeze2diretta and DirettaRendererUPnP
 - **Lock-free ring buffers**: SPSC design with SIMD optimizations (AVX2/NEON)
-- **Adaptive prebuffer**: 500ms target with flow control
+- **Optimized audio delivery**: 2048-frame push chunks with event-based flow control and adaptive throttle (aligned with DirettaRendererUPnP)
+- **Adaptive prebuffer**: 500ms (normal) / 1500ms (>192kHz) with flow control
 - **Quick resume**: Same-format track transitions without full reconnection
 - **Clean transitions**: Silence injection on pause/stop/format changes
 - **Auto-release**: Diretta target released after 5s idle for coexistence with other Diretta hosts
@@ -193,10 +204,43 @@ Both tools share the same **DirettaSync v2.0** engine for Diretta output.
 - **Build tools**: gcc/g++ 7.0+, make, CMake 3.10+
 - **Required library**: libFLAC
 - **Optional libraries** (for internet radio): libmpg123 (MP3), libvorbis (Ogg), fdk-aac (AAC)
+- **Optional library** (for FFmpeg backend): libavcodec, libavutil
 
 ---
 
 ## Upgrading
+
+### From v1.1.x to v1.2.0
+
+```bash
+# 1. Stop the service
+sudo systemctl stop slim2diretta@1
+
+# 2. Install FFmpeg development libraries (optional, for FFmpeg backend)
+./install.sh --codecs
+# Or manually:
+#   Fedora:  sudo dnf install ffmpeg-free-devel
+#   Ubuntu:  sudo apt install libavcodec-dev libavutil-dev
+#   Arch:    sudo pacman -S ffmpeg
+
+# 3. Pull the latest version
+cd ~/slim2diretta
+git pull
+
+# 4. Rebuild (re-run cmake to detect new libraries)
+cd build
+cmake ..
+make -j$(nproc)
+
+# 5. Update the installed binary
+sudo cp slim2diretta /usr/local/bin/
+# Or use: ./install.sh --update
+
+# 6. Restart the service
+sudo systemctl start slim2diretta@1
+```
+
+> **What's new in v1.2.0:** FFmpeg decoder backend (`--decoder ffmpeg`) as an alternative to the native decoders. Users report a warmer, more enveloping sound with FFmpeg compared to the brighter native backend. Switch via CLI or Web UI. Also includes all v1.1.1 fixes (Roon seek, high sample rate buffers, FLAC log spam).
 
 ### From v1.0.0 to v1.1.0
 
@@ -261,13 +305,14 @@ chmod +x install.sh
 > ```
 
 The installer provides an interactive menu with options for:
-- **Full installation** (recommended) - Dependencies, build, and systemd service
+- **Full installation** (recommended) - Dependencies, optional codecs, build, and systemd service
 - **Build only** - Compile slim2diretta (if dependencies are already installed)
 - **Install systemd service** - Set up automatic startup
 - **Update binary** - Rebuild and replace after code changes
 - **Configure network** - MTU, buffers, and firewall
 - **Test** - Verify installation and list Diretta targets
 - **Install web configuration UI** - Browser-based settings (port 8081)
+- **Install optional codecs** - MP3, OGG, AAC libraries and FFmpeg backend
 - **Aggressive optimization** (Fedora only) - For dedicated audio servers
 - **Uninstall** - Clean removal
 
@@ -278,6 +323,7 @@ The installer provides an interactive menu with options for:
 ./install.sh --service    # Install systemd service only
 ./install.sh --update     # Rebuild and update installed binary
 ./install.sh --webui      # Install web configuration UI
+./install.sh --codecs     # Install optional codec libraries (MP3, OGG, AAC, FFmpeg)
 ./install.sh --uninstall  # Remove slim2diretta
 ./install.sh --help       # Show all options
 ```
@@ -294,6 +340,8 @@ The installer provides an interactive menu with options for:
 sudo dnf install -y gcc-c++ make cmake pkg-config flac-devel
 # Optional codecs (recommended for internet radio)
 sudo dnf install -y mpg123-devel libvorbis-devel fdk-aac-free-devel
+# Optional FFmpeg backend
+sudo dnf install -y ffmpeg-free-devel
 ```
 
 **Ubuntu/Debian:**
@@ -302,6 +350,8 @@ sudo dnf install -y mpg123-devel libvorbis-devel fdk-aac-free-devel
 sudo apt install -y build-essential cmake pkg-config libflac-dev
 # Optional codecs (recommended for internet radio)
 sudo apt install -y libmpg123-dev libvorbis-dev libfdk-aac-dev
+# Optional FFmpeg backend
+sudo apt install -y libavcodec-dev libavutil-dev
 ```
 
 **Arch/AudioLinux:**
@@ -310,9 +360,11 @@ sudo apt install -y libmpg123-dev libvorbis-dev libfdk-aac-dev
 sudo pacman -S base-devel cmake pkgconf flac
 # Optional codecs (recommended for internet radio)
 sudo pacman -S mpg123 libvorbis libfdk-aac
+# Optional FFmpeg backend
+sudo pacman -S ffmpeg
 ```
 
-> **Note**: Codec libraries are optional. If a library is not found at build time, the corresponding codec is simply disabled. FLAC and PCM are always available.
+> **Note**: Codec libraries are optional. If a library is not found at build time, the corresponding codec is simply disabled. FLAC and PCM are always available. The FFmpeg backend is also optional — if not installed, the `--decoder ffmpeg` option is unavailable.
 
 #### 2. Download Diretta Host SDK
 
@@ -421,6 +473,7 @@ Options:
   --version                      Show version and exit
   --max-rate <hz>                Max PCM sample rate (default: 1536000)
   --no-dsd                       Disable DSD support
+  --decoder <backend>            Decoder backend: native (default), ffmpeg
 
 Diretta Advanced Options:
   --transfer-mode <mode>         Transfer scheduling mode (default: auto)
@@ -581,7 +634,7 @@ slim2diretta supports internet radio playback via the following codecs:
 
 All codecs include **error recovery** for robust radio streaming (automatic resync on corrupted frames, gap handling).
 
-CMake reports the codec status during build:
+CMake reports the codec and backend status during build:
 ```
 -- Codecs:
 --   FLAC:           ENABLED (always)
@@ -589,9 +642,13 @@ CMake reports the codec status during build:
 --   MP3:            ENABLED (libmpg123)
 --   Ogg Vorbis:     ENABLED (libvorbisfile)
 --   AAC:            ENABLED (fdk-aac)
+--
+-- Backends:
+--   FFmpeg:         ENABLED (--decoder ffmpeg)
 ```
 
 To disable a specific codec: `cmake -DENABLE_MP3=OFF ..`
+To disable FFmpeg backend: `cmake -DENABLE_FFMPEG=OFF ..`
 
 ---
 
@@ -602,7 +659,7 @@ slim2diretta works with **Roon** in Squeezebox emulation mode:
 - Roon uses an older Slimproto protocol (LMS 6.0.x era)
 - PCM is limited to **24-bit / 192kHz**
 - DSD is sent as **DoP** (DSD over PCM), up to **DSD128**
-- slim2diretta **automatically detects DoP** and converts to native DSD
+- slim2diretta **automatically detects DoP** and passes it through as 24-bit PCM to the Diretta Target, which handles the DoP→DAC forwarding
 
 No special configuration needed for Roon. Simply enable Squeezebox support in Roon and slim2diretta will appear as a player.
 
@@ -727,4 +784,4 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 **Enjoy native DSD and hi-res PCM streaming from your LMS library!**
 
-*Last updated: 2026-03-06 (v1.1.0)*
+*Last updated: 2026-03-12 (v1.2.0)*

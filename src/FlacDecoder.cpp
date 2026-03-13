@@ -433,6 +433,9 @@ void FlacDecoder::metadataCallback(
 
     if (metadata->type == FLAC__METADATA_TYPE_STREAMINFO) {
         const auto& info = metadata->data.stream_info;
+
+        bool firstTime = !self->m_formatReady;
+
         self->m_format.sampleRate = info.sample_rate;
         self->m_format.bitDepth = info.bits_per_sample;
         self->m_format.channels = info.channels;
@@ -442,12 +445,15 @@ void FlacDecoder::metadataCallback(
         self->m_shift = 32 - static_cast<int>(info.bits_per_sample);
         self->m_formatReady = true;
 
-        LOG_INFO("[FLAC] Format: " << info.sample_rate << " Hz, "
-                 << info.bits_per_sample << "-bit, "
-                 << info.channels << " ch"
-                 << (info.total_samples > 0
-                     ? ", " + std::to_string(info.total_samples) + " samples"
-                     : ""));
+        // Only log once — metadata retries re-trigger this callback
+        if (firstTime) {
+            LOG_INFO("[FLAC] Format: " << info.sample_rate << " Hz, "
+                     << info.bits_per_sample << "-bit, "
+                     << info.channels << " ch"
+                     << (info.total_samples > 0
+                         ? ", " + std::to_string(info.total_samples) + " samples"
+                         : ""));
+        }
     }
 }
 

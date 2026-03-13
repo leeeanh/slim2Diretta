@@ -34,7 +34,7 @@
 #include <unistd.h>
 #include <poll.h>
 
-#define SLIM2DIRETTA_VERSION "1.1.0"
+#define SLIM2DIRETTA_VERSION "1.2.0"
 
 // ============================================
 // Async Logging Infrastructure
@@ -235,6 +235,13 @@ Config parseArguments(int argc, char* argv[]) {
         else if (arg == "--no-dsd") {
             config.dsdEnabled = false;
         }
+        else if (arg == "--decoder" && i + 1 < argc) {
+            config.decoderBackend = argv[++i];
+            if (config.decoderBackend != "native" && config.decoderBackend != "ffmpeg") {
+                std::cerr << "Invalid decoder backend. Use: native, ffmpeg" << std::endl;
+                exit(1);
+            }
+        }
         else if (arg == "--list-targets" || arg == "-l") {
             config.listTargets = true;
         }
@@ -276,6 +283,7 @@ Config parseArguments(int argc, char* argv[]) {
                       << "Audio:\n"
                       << "  --max-rate <hz>        Max sample rate (default: 1536000)\n"
                       << "  --no-dsd               Disable DSD support\n"
+                      << "  --decoder <backend>    Decoder backend: native (default), ffmpeg\n"
                       << "\n"
                       << "Logging:\n"
                       << "  -v, --verbose          Debug output (log level: DEBUG)\n"
@@ -353,7 +361,55 @@ int main(int argc, char* argv[]) {
               << "═══════════════════════════════════════════════════════\n"
               << std::endl;
 
+    // Log build capabilities for diagnostics
+    {
+        const char* arch =
+#if defined(__aarch64__)
+            "aarch64"
+#elif defined(__x86_64__) || defined(_M_X64)
+            "x86_64"
+#elif defined(__i386__) || defined(_M_IX86)
+            "x86"
+#elif defined(__arm__)
+            "arm"
+#else
+            "unknown"
+#endif
+        ;
+        const char* simd =
+#if DIRETTA_HAS_AVX2
+            "AVX2"
+#elif DIRETTA_HAS_NEON
+            "NEON"
+#else
+            "scalar"
+#endif
+        ;
+        std::cout << "Build: " << arch << " " << simd
+                  << " (" << __DATE__ << ")" << std::endl;
+    }
+
+    // Log decoder backend info
+    std::cout << "Codecs: FLAC PCM"
+#ifdef ENABLE_MP3
+              << " MP3"
+#endif
+#ifdef ENABLE_OGG
+              << " OGG"
+#endif
+#ifdef ENABLE_AAC
+              << " AAC"
+#endif
+#ifdef ENABLE_FFMPEG
+              << " [FFmpeg available]"
+#endif
+              << " DSD" << std::endl;
+
     Config config = parseArguments(argc, argv);
+
+    if (config.decoderBackend == "ffmpeg") {
+        std::cout << "Decoder: FFmpeg backend" << std::endl;
+    }
 
     // Apply log level
     if (config.verbose) {
@@ -582,7 +638,7 @@ int main(int argc, char* argv[]) {
                 char pcmEndian = cmd.pcmEndian;
                 audioTestRunning.store(true);
                 audioThreadDone.store(false, std::memory_order_release);
-                audioTestThread = std::thread([&httpStream, &slimproto, &audioTestRunning, &audioThreadDone, &hasPendingTrack, &pendingMutex, &pendingNextTrack, formatCode, pcmRate, pcmSize, pcmChannels, pcmEndian, direttaPtr]() {
+                audioTestThread = std::thread([&httpStream, &slimproto, &audioTestRunning, &audioThreadDone, &hasPendingTrack, &pendingMutex, &pendingNextTrack, formatCode, pcmRate, pcmSize, pcmChannels, pcmEndian, direttaPtr, &config]() {
 
                     // ============================================================
                     // DSD PATH — separate from PCM/FLAC
@@ -842,7 +898,12 @@ int main(int argc, char* argv[]) {
                         break;  // Exit DSD chaining loop
                       }  // end DSD chaining loop
 
-                      slimproto->sendStat(StatEvent::STMu);
+                      // Only send STMu (track ended) on natural end, not on forced stop
+                      // Sending STMu after strm-q confuses Roon into thinking the
+                      // new seek stream has ended, causing it to skip to the next track
+                      if (audioTestRunning.load(std::memory_order_acquire)) {
+                          slimproto->sendStat(StatEvent::STMu);
+                      }
                       audioThreadDone.store(true, std::memory_order_release);
                       return;
                     }
@@ -862,7 +923,7 @@ int main(int argc, char* argv[]) {
                     while (true) {  // === PCM/FLAC CHAINING LOOP ===
 
                     // Create decoder for this format
-                    auto decoder = Decoder::create(curFormatCode);
+                    auto decoder = Decoder::create(curFormatCode, config.decoderBackend);
                     if (!decoder) {
                         LOG_ERROR("[Audio] Unsupported format: " << curFormatCode);
                         slimproto->sendStat(StatEvent::STMn);
@@ -915,15 +976,17 @@ int main(int argc, char* argv[]) {
                     size_t w = 0;  // producer-local sample counter
                     size_t r = 0;  // sender-local sample counter
 
-                    constexpr unsigned int PREBUFFER_MS = 500;
+                    // Adaptive prebuffer: high sample rates (>192kHz) need more margin
+                    // because LMS streams at ~1x real-time at these rates
+                    constexpr unsigned int PREBUFFER_MS_NORMAL = 500;
+                    constexpr unsigned int PREBUFFER_MS_HIGHRATE = 1500;
+                    unsigned int prebufferMs = PREBUFFER_MS_NORMAL;
                     uint64_t pushedFrames = 0;  // Frames actually sent to DirettaSync
                     AudioFormat audioFmt{};
                     int detectedChannels = 2;
 
-                    // DoP (DSD over PCM) detection — Roon sends DSD as DoP
+                    // DoP (DSD over PCM) detection - Roon sends DSD as DoP.
                     bool dopDetected = false;
-                    uint32_t dopPcmRate = 0;  // Original PCM carrier rate for elapsed
-                    std::vector<uint8_t> dopBuf;  // Conversion buffer (allocated if DoP)
 
                     // --- Shared state: producer writes once, sender reads after flag ---
                     std::atomic<bool> audioFmtReady{false};
@@ -1054,10 +1117,13 @@ int main(int argc, char* argv[]) {
                                 audioFmt.sampleRate = fmt.sampleRate;
                                 audioFmt.bitDepth = 32;
                                 audioFmt.channels = fmt.channels;
-                                audioFmt.isCompressed = (formatCode == FORMAT_FLAC ||
-                                                         formatCode == FORMAT_MP3 ||
-                                                         formatCode == FORMAT_OGG ||
-                                                         formatCode == FORMAT_AAC);
+                                audioFmt.isCompressed = (curFormatCode == FORMAT_FLAC ||
+                                                         curFormatCode == FORMAT_MP3 ||
+                                                         curFormatCode == FORMAT_OGG ||
+                                                         curFormatCode == FORMAT_AAC);
+                                if (fmt.sampleRate > DirettaBuffer::HIGHRATE_THRESHOLD) {
+                                    prebufferMs = PREBUFFER_MS_HIGHRATE;
+                                }
                                 snapshotSampleRate = fmt.sampleRate;
                                 snapshotTotalSec = (fmt.totalSamples > 0 && fmt.sampleRate > 0)
                                     ? static_cast<uint32_t>(fmt.totalSamples / fmt.sampleRate)
@@ -1069,7 +1135,7 @@ int main(int argc, char* argv[]) {
                             if (audioFmtReady.load(std::memory_order_relaxed) &&
                                 !prebufferReady.load(std::memory_order_relaxed)) {
                                 size_t targetFrames =
-                                    static_cast<size_t>(snapshotSampleRate) * PREBUFFER_MS / 1000;
+                                    static_cast<size_t>(snapshotSampleRate) * prebufferMs / 1000;
                                 if (cacheBufferedFrames() >= targetFrames || producerEof) {
                                     prebufferReady.store(true, std::memory_order_release);
                                 }
@@ -1164,25 +1230,18 @@ int main(int argc, char* argv[]) {
                             }
                             if (detectDoP(samples, cacheContiguousFrames(), detectedChannels)) {
                                 dopDetected = true;
-                                dopPcmRate = audioFmt.sampleRate;
-                                uint32_t dsdRate = DsdProcessor::calculateDsdRate(dopPcmRate, true);
-                                audioFmt.isDSD = true;
-                                audioFmt.sampleRate = dsdRate;
-                                audioFmt.dsdFormat = AudioFormat::DSDFormat::DFF;
-                                dopBuf.resize(MAX_DECODE_FRAMES * 2 * detectedChannels);
-                                LOG_INFO("[Audio] DoP detected - "
-                                    << DsdProcessor::rateName(dsdRate)
-                                    << " (" << dsdRate << " Hz), "
+                                audioFmt.isDSD = false;
+                                audioFmt.bitDepth = 24;
+                                LOG_INFO("[Audio] DoP detected - passthrough as 24-bit PCM, "
                                     << detectedChannels << " ch, carrier "
-                                    << dopPcmRate << " Hz");
+                                    << audioFmt.sampleRate << " Hz");
                             }
                         }
 
                         // Open Diretta
                         size_t prebufFrames = cacheAvailFrames();
                         uint32_t prebufMs = static_cast<uint32_t>(
-                            prebufFrames * 1000 /
-                            (dopDetected ? dopPcmRate : audioFmt.sampleRate));
+                            prebufFrames * 1000 / audioFmt.sampleRate);
                         LOG_INFO("[Sender] Pre-buffered " << prebufFrames
                                  << " frames (" << prebufMs << "ms)");
 
@@ -1193,10 +1252,8 @@ int main(int argc, char* argv[]) {
                             direttaPtr->notifySpaceAvailable();
                             return;
                         }
-                        if (!dopDetected) {
-                            direttaPtr->setS24PackModeHint(
-                                DirettaRingBuffer::S24PackMode::MsbAligned);
-                        }
+                        direttaPtr->setS24PackModeHint(
+                            DirettaRingBuffer::S24PackMode::MsbAligned);
                         senderOpenedDiretta.store(true, std::memory_order_release);
                         bool direttaOpened = true;
                         slimproto->sendStat(StatEvent::STMl);
@@ -1204,23 +1261,13 @@ int main(int argc, char* argv[]) {
                         uint64_t seenEpoch = direttaPtr->getPopEpoch();
 
                         auto sendChunk = [&](size_t frames) {
-                            const int32_t* ptr = cacheReadPtr();
-                            if (dopDetected) {
-                                DsdProcessor::convertDopToNative(
-                                    reinterpret_cast<const uint8_t*>(ptr),
-                                    dopBuf.data(), frames, detectedChannels);
-                                size_t dsdBytes = frames * 2 * detectedChannels;
-                                size_t numDsdSamples = dsdBytes * 8 / detectedChannels;
-                                direttaPtr->sendAudio(dopBuf.data(), numDsdSamples);
-                            } else {
-                                direttaPtr->sendAudio(
-                                    reinterpret_cast<const uint8_t*>(ptr), frames);
-                            }
+                            direttaPtr->sendAudio(
+                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
                             cachePopFrames(frames);
                             pushedFrames += frames;
                         };
 
-                        uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
+                        uint32_t rate = snapshotSampleRate;
 
                         auto updateElapsed = [&]() {
                             if (rate == 0) return;
@@ -1282,7 +1329,6 @@ int main(int argc, char* argv[]) {
                                 size_t contiguous = cacheContiguousFrames();
                                 if (contiguous > 0) sendChunk(std::min(contiguous, chunkFrames));
                             } else {
-                                uint32_t rate = dopDetected ? dopPcmRate : snapshotSampleRate;
                                 size_t steadyChunkFrames = (rate > 0)
                                     ? std::clamp(
                                           static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
