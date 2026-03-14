@@ -272,6 +272,7 @@ CORE_SOURCES := \
 	src/Decoder.cpp \
 	src/FlacDecoder.cpp \
 	src/PcmDecoder.cpp \
+	src/FfmpegDecoder.cpp \
 	src/DsdProcessor.cpp \
 	src/DsdStreamReader.cpp \
 	diretta/DirettaSync.cpp \
@@ -305,13 +306,17 @@ CPPFLAGS += \
 	-I$(SRCDIR) \
 	-I$(DIRETTADIR) \
 	-I$(SDK_PATH)/Host \
+	-I/usr/include/ffmpeg \
+	-I/usr/local/include \
 	$(FLAC_CFLAGS) \
 	$(MPG123_CFLAGS) \
 	$(VORBIS_CFLAGS) \
-	$(FDKAAC_CFLAGS)
+	$(FDKAAC_CFLAGS) \
+	-DENABLE_FFMPEG
 
 CXXFLAGS += -pthread
 LDFLAGS += -pthread
+LDFLAGS += -L/usr/local/lib
 
 LDLIBS += \
 	$(SDK_LIB_DIRETTA) \
@@ -320,6 +325,8 @@ LDLIBS += \
 	$(MPG123_LIBS) \
 	$(VORBIS_LIBS) \
 	$(FDKAAC_LIBS) \
+	-lavcodec \
+	-lavutil \
 	-ldl
 
 # SIMD tuning (compatible with old CMake behavior)
@@ -403,6 +410,8 @@ else
 AAC_STATUS := DISABLED (fdk-aac not found)
 endif
 
+FFMPEG_STATUS := ENABLED (direct Makefile linkage)
+
 ifeq ($(HAVE_FLAC),1)
 FLAC_STATUS := ENABLED (required)
 else
@@ -466,6 +475,7 @@ info:
 	@echo "  MP3:            $(MP3_STATUS)"
 	@echo "  Ogg Vorbis:     $(OGG_STATUS)"
 	@echo "  AAC:            $(AAC_STATUS)"
+	@echo "  FFmpeg:         $(FFMPEG_STATUS)"
 	@echo "Build:"
 	@echo "  Compiler:       $(CXX)"
 	@echo "  Target:         $(TARGET)"
