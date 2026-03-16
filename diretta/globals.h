@@ -16,8 +16,14 @@ class LogRing;
 // Global verbose flag for logging (kept for backward compatibility with DirettaSync)
 extern bool g_verbose;
 
-// Global SCHED_FIFO real-time priority for worker threads (1-99, default 50)
+// Global SCHED_FIFO real-time priority for sender thread (1-99, default 50)
 extern int g_rtPriority;
+
+// Global SCHED_FIFO real-time priority for SDK worker thread (0 = auto: g_rtPriority+1)
+extern int g_rtWorkerPriority;
+
+// Global CPU core affinity for RT threads (-1 = no pinning, default)
+extern int g_rtCpuCore;
 
 // Global log ring for async logging (optional, can be nullptr)
 extern LogRing* g_logRing;

@@ -104,7 +104,11 @@ extern LogRing* g_logRing;
 
 extern bool g_verbose;
 extern int g_rtPriority;
+extern int g_rtWorkerPriority;
+extern int g_rtCpuCore;
 bool setRealtimePriority(int priority);
+bool setCpuAffinity(int core);
+bool attachEvlThread(const char* name);
 #include "LogLevel.h"
 
 #ifdef NOLOG

@@ -232,6 +232,20 @@ Config parseArguments(int argc, char* argv[]) {
                 g_rtPriority = std::max(1, std::min(99, g_rtPriority));
             }
         }
+        else if (arg == "--rt-worker-priority" && i + 1 < argc) {
+            g_rtWorkerPriority = std::atoi(argv[++i]);
+            if (g_rtWorkerPriority < 1 || g_rtWorkerPriority > 99) {
+                std::cerr << "Warning: rt-worker-priority should be between 1-99" << std::endl;
+                g_rtWorkerPriority = std::max(1, std::min(99, g_rtWorkerPriority));
+            }
+        }
+        else if (arg == "--rt-cpu" && i + 1 < argc) {
+            g_rtCpuCore = std::atoi(argv[++i]);
+            if (g_rtCpuCore < 0) {
+                std::cerr << "Warning: rt-cpu must be >= 0, disabling" << std::endl;
+                g_rtCpuCore = -1;
+            }
+        }
         else if (arg == "--max-rate" && i + 1 < argc) {
             config.maxSampleRate = std::atoi(argv[++i]);
         }
@@ -281,7 +295,9 @@ Config parseArguments(int argc, char* argv[]) {
                       << "                             2048=NoSleepForce, 4096=LimitResend,\n"
                       << "                             8192=NoJumboFrame, 16384=NoFirewall, 32768=NoRawSocket\n"
                       << "  --mtu <bytes>              MTU override (default: auto)\n"
-                      << "  --rt-priority <1-99>       SCHED_FIFO real-time priority for worker thread (default: 50)\n"
+                      << "  --rt-priority <1-99>       SCHED_FIFO priority for sender thread (default: 50)\n"
+                      << "  --rt-worker-priority <1-99> SCHED_FIFO priority for SDK worker thread (default: rt-priority+1)\n"
+                      << "  --rt-cpu <core>            Pin RT threads to CPU core, e.g. --rt-cpu 3 (default: no pinning)\n"
                       << "\n"
                       << "Audio:\n"
                       << "  --max-rate <hz>        Max sample rate (default: 1536000)\n"
@@ -1239,6 +1255,8 @@ int main(int argc, char* argv[]) {
 
                     std::thread senderThread([&]() {
                         setRealtimePriority(g_rtPriority);
+                        setCpuAffinity(g_rtCpuCore);
+                        attachEvlThread("sender");
                         while (audioTestRunning.load(std::memory_order_acquire) &&
                                !prebufferReady.load(std::memory_order_acquire) &&
                                !producerDone.load(std::memory_order_acquire)) {

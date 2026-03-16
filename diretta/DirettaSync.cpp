@@ -11,6 +11,9 @@
 #include <iomanip>
 #include <pthread.h>
 #include <sched.h>
+#ifdef HAVE_EVL
+#include <evl/thread.h>
+#endif
 
 // F1: Thread priority elevation for reduced jitter
 // Sets SCHED_FIFO real-time priority (requires root on Linux)
@@ -33,6 +36,48 @@ bool setRealtimePriority(int priority) {
         std::cout << "[DirettaSync] Thread set to SCHED_FIFO priority " << priority << std::endl;
     }
     return true;
+}
+
+bool setCpuAffinity(int core) {
+    if (core < 0) return true;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+
+    int ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (ret != 0) {
+        if (g_verbose) {
+            std::cerr << "[DirettaSync] Warning: Could not set CPU affinity to core "
+                      << core << " (error " << ret << ")" << std::endl;
+        }
+        return false;
+    }
+
+    if (g_verbose) {
+        std::cout << "[DirettaSync] Thread pinned to CPU core " << core << std::endl;
+    }
+    return true;
+}
+
+bool attachEvlThread(const char* name) {
+#ifdef HAVE_EVL
+    int ret = evl_attach_self("/slim2diretta:%s", name);
+    if (ret < 0) {
+        if (g_verbose) {
+            std::cerr << "[DirettaSync] Warning: EVL attach failed for thread '"
+                      << name << "' (error " << ret << ")" << std::endl;
+        }
+        return false;
+    }
+    if (g_verbose) {
+        std::cout << "[DirettaSync] Thread '" << name << "' attached to EVL" << std::endl;
+    }
+    return true;
+#else
+    (void)name;
+    return true;
+#endif
 }
 
 namespace {
@@ -1777,9 +1822,13 @@ bool DirettaSync::startSyncWorker() {
     m_stopRequested = false;
 
     m_workerThread = std::thread([this]() {
-        // F1: Elevate worker thread priority for reduced jitter
-        // SCHED_FIFO priority 50 (mid-range real-time) - requires root/CAP_SYS_NICE
-        setRealtimePriority(g_rtPriority);
+        // F1: Elevate worker thread priority, optionally pin to isolated core, attach to EVL
+        // SDK worker runs at higher priority than sender (default: g_rtPriority + 1)
+        int workerPrio = (g_rtWorkerPriority > 0) ? g_rtWorkerPriority
+                                                   : std::min(99, g_rtPriority + 1);
+        setRealtimePriority(workerPrio);
+        setCpuAffinity(g_rtCpuCore);
+        attachEvlThread("sdk-worker");
 
         while (m_running.load(std::memory_order_acquire)) {
             if (!syncWorker()) {

@@ -194,6 +194,7 @@ endif
 ENABLE_MP3 ?= auto
 ENABLE_OGG ?= auto
 ENABLE_AAC ?= auto
+ENABLE_EVL ?= auto
 ENABLE_DSD ?= 1
 
 ifeq ($(filter 0 1,$(ENABLE_DSD)),)
@@ -203,6 +204,7 @@ endif
 HAVE_MP3 := 0
 HAVE_OGG := 0
 HAVE_AAC := 0
+HAVE_EVL := 0
 HAVE_DSD := 1
 
 ifneq ($(ENABLE_MP3),0)
@@ -263,6 +265,31 @@ ifeq ($(ENABLE_AAC),1)
 ifeq ($(HAVE_AAC),0)
 ifeq ($(NEED_BUILD_DEPS),1)
 $(error AAC requested (ENABLE_AAC=1), but fdk-aac was not found)
+endif
+endif
+endif
+endif
+
+# ============================================
+# Optional RT: EVL (libevl) - EVL thread attachment for RT isolation
+# ============================================
+
+ifneq ($(ENABLE_EVL),0)
+ifeq ($(HAVE_PKG_CONFIG),1)
+EVL_CFLAGS := $(shell pkg-config --cflags evl 2>/dev/null)
+EVL_LIBS := $(shell pkg-config --libs evl 2>/dev/null)
+endif
+ifneq ($(strip $(EVL_LIBS)),)
+HAVE_EVL := 1
+else ifneq (,$(wildcard /usr/include/evl/thread.h /usr/local/include/evl/thread.h))
+HAVE_EVL := 1
+EVL_CFLAGS :=
+EVL_LIBS := -levl
+endif
+ifeq ($(ENABLE_EVL),1)
+ifeq ($(HAVE_EVL),0)
+ifeq ($(NEED_BUILD_DEPS),1)
+$(error EVL requested (ENABLE_EVL=1), but libevl was not found)
 endif
 endif
 endif
@@ -333,6 +360,10 @@ CPPFLAGS += \
 	$(FDKAAC_CFLAGS) \
 	-DENABLE_FFMPEG
 
+ifeq ($(HAVE_EVL),1)
+CPPFLAGS += -DHAVE_EVL $(EVL_CFLAGS)
+endif
+
 CXXFLAGS += -pthread
 LDFLAGS += -pthread
 LDFLAGS += -L/usr/local/lib
@@ -344,6 +375,7 @@ LDLIBS += \
 	$(MPG123_LIBS) \
 	$(VORBIS_LIBS) \
 	$(FDKAAC_LIBS) \
+	$(EVL_LIBS) \
 	-lavcodec \
 	-lavutil \
 	-ldl
@@ -429,6 +461,12 @@ else
 AAC_STATUS := DISABLED (fdk-aac not found)
 endif
 
+ifeq ($(HAVE_EVL),1)
+EVL_STATUS := ENABLED (libevl)
+else
+EVL_STATUS := DISABLED (libevl not found)
+endif
+
 ifeq ($(HAVE_DSD),1)
 DSD_STATUS := ENABLED
 else
@@ -502,6 +540,8 @@ info:
 	@echo "  AAC:            $(AAC_STATUS)"
 	@echo "  DSD:            $(DSD_STATUS)"
 	@echo "  FFmpeg:         $(FFMPEG_STATUS)"
+	@echo "RT:"
+	@echo "  EVL:            $(EVL_STATUS)"
 	@echo "Build:"
 	@echo "  Compiler:       $(CXX)"
 	@echo "  Target:         $(TARGET)"
