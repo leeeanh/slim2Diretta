@@ -27,8 +27,8 @@
 #include <iostream>
 #include <cmath>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
-#include <sstream>
 #include <condition_variable>
 
 //=============================================================================
@@ -110,7 +110,7 @@ bool setRealtimePriority(int priority);
 #ifdef NOLOG
 // Production build: compile out all verbose logging for zero overhead
 #define DIRETTA_LOG(msg) do {} while(0)
-#define DIRETTA_LOG_ASYNC(msg) do {} while(0)
+#define DIRETTA_LOG_ASYNC(...) do {} while(0)
 #else
 // Debug build: check g_logLevel at runtime
 #define DIRETTA_LOG(msg) do { \
@@ -119,12 +119,12 @@ bool setRealtimePriority(int priority);
     } \
 } while(0)
 
-// Async logging macro for hot paths (non-blocking)
-#define DIRETTA_LOG_ASYNC(msg) do { \
+// Async logging macro for hot paths (non-blocking, stack-only formatting)
+#define DIRETTA_LOG_ASYNC(fmt, ...) do { \
     if (g_logRing && g_logLevel >= LogLevel::DEBUG) { \
-        std::ostringstream _oss; \
-        _oss << msg; \
-        g_logRing->push(_oss.str().c_str()); \
+        char _buf[248]; \
+        std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__); \
+        g_logRing->push(_buf); \
     } \
 } while(0)
 #endif

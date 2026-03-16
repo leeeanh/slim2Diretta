@@ -1235,8 +1235,6 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
 
     // Increment format generation to invalidate cached values in sendAudio
     m_formatGeneration.fetch_add(1, std::memory_order_release);
-    // C1: Also increment consumer generation for getNewStream
-    m_consumerStateGen.fetch_add(1, std::memory_order_release);
 
     size_t bytesPerSecond = static_cast<size_t>(rate) * channels * direttaBps;
     float bufferSec = DirettaBuffer::pcmBufferSeconds(static_cast<uint32_t>(rate));
@@ -1279,6 +1277,10 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     }
     m_prefillComplete = false;
 
+    // A1: Preallocate to max callback size; move generation bump to after all state is written
+    m_streamData.resize(bytesPerBuffer + (framesRemainder != 0 ? static_cast<size_t>(bytesPerFrame) : 0));
+    m_consumerStateGen.fetch_add(1, std::memory_order_release);
+
     DIRETTA_LOG("Ring PCM: " << rate << "Hz " << channels << "ch "
                 << direttaBps << "bps, buffer=" << ringSize
                 << ", prefill=" << m_prefillTargetBuffers << " buffers ("
@@ -1299,8 +1301,6 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
 
     // Increment format generation to invalidate cached values in sendAudio
     m_formatGeneration.fetch_add(1, std::memory_order_release);
-    // C1: Also increment consumer generation for getNewStream
-    m_consumerStateGen.fetch_add(1, std::memory_order_release);
 
     uint32_t bytesPerSecond = byteRate * channels;
     size_t ringSize = DirettaBuffer::calculateBufferSize(bytesPerSecond, DirettaBuffer::DSD_BUFFER_SECONDS);
@@ -1321,6 +1321,10 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     m_prefillTargetBuffers = calculateAlignedPrefill(bytesPerSecond, bytesPerBuffer, true, false);
     m_prefillTarget = m_prefillTargetBuffers * bytesPerBuffer;
     m_prefillComplete = false;
+
+    // A1: Preallocate to exact DSD callback size; move generation bump to after all state is written
+    m_streamData.resize(bytesPerBuffer);
+    m_consumerStateGen.fetch_add(1, std::memory_order_release);
 
     DIRETTA_LOG("Ring DSD: byteRate=" << byteRate << " ch=" << channels
                 << " buffer=" << ringSize << " prefill=" << m_prefillTargetBuffers
@@ -1502,13 +1506,12 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
             }
         }
 
-        if (g_verbose) {
+        {
             int count = m_pushCount.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count <= 3 || count % 500 == 0) {
-                // A3: Async logging in hot path - avoids cout blocking
-                DIRETTA_LOG_ASYNC("sendAudio #" << count << " in=" << totalBytes
-                                  << " out=" << written << " avail=" << m_ringBuffer.getAvailable()
-                                  << " [" << formatLabel << "]");
+                DIRETTA_LOG_ASYNC("sendAudio #%d in=%zu out=%zu avail=%zu [%s]",
+                                  count, totalBytes, written,
+                                  m_ringBuffer.getAvailable(), formatLabel);
             }
         }
     }
@@ -1601,10 +1604,7 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
     }
 
     // SDK 148 WORKAROUND: Use our own buffer instead of Stream::resize()
-    // Resize our persistent buffer if needed
-    if (m_streamData.size() != static_cast<size_t>(currentBytesPerBuffer)) {
-        m_streamData.resize(currentBytesPerBuffer);
-    }
+    // Buffer is preallocated to max callback size in configureRingPCM/DSD
 
     // Directly set the diretta_stream C structure fields
     // The SDK only reads Data.P (pointer) and Size fields
@@ -1641,15 +1641,16 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
 
     // Prefill not complete
     if (!m_prefillComplete.load(std::memory_order_acquire)) {
-        // Diagnostic: Log prefill progress periodically (only in verbose mode)
-        if (g_verbose) {
+        // Diagnostic: Log prefill progress periodically
+        {
             static int prefillLogCount = 0;
-            size_t avail = m_ringBuffer.getAvailable();
             if (prefillLogCount++ % 50 == 0) {  // Log every 50th call (~100ms at typical rates)
-                float pct = (m_prefillTarget > 0) ? (100.0f * avail / m_prefillTarget) : 0.0f;
-                std::cout << "[Prefill] Waiting: " << avail << "/" << m_prefillTarget
-                          << " bytes (" << std::fixed << std::setprecision(1) << pct << "%)"
-                          << (currentIsDsd ? " [DSD]" : " [PCM]") << std::endl;
+                size_t prefillAvail = m_ringBuffer.getAvailable();
+                [[maybe_unused]] float pct =
+                    (m_prefillTarget > 0) ? (100.0f * prefillAvail / m_prefillTarget) : 0.0f;
+                DIRETTA_LOG_ASYNC("[Prefill] Waiting: %zu/%zu bytes (%.1f%%)%s",
+                                  prefillAvail, m_prefillTarget, pct,
+                                  currentIsDsd ? " [DSD]" : " [PCM]");
             }
         }
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
@@ -1702,12 +1703,12 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
     int count = m_streamCount.fetch_add(1, std::memory_order_relaxed) + 1;
     size_t avail = m_ringBuffer.getAvailable();
 
-    if (g_verbose && (count <= 5 || count % 5000 == 0)) {
-        float fillPct = (currentRingSize > 0) ? (100.0f * avail / currentRingSize) : 0.0f;
-        // A3: Async logging in hot path - avoids cout blocking in Diretta callback
-        DIRETTA_LOG_ASYNC("getNewStream #" << count << " bpb=" << currentBytesPerBuffer
-                          << " avail=" << avail << " (" << std::fixed << std::setprecision(1)
-                          << fillPct << "%) " << (currentIsDsd ? "[DSD]" : "[PCM]"));
+    if (count <= 5 || count % 5000 == 0) {
+        [[maybe_unused]] float fillPct =
+            (currentRingSize > 0) ? (100.0f * avail / currentRingSize) : 0.0f;
+        DIRETTA_LOG_ASYNC("getNewStream #%d bpb=%d avail=%zu (%.1f%%) %s",
+                          count, currentBytesPerBuffer, avail, fillPct,
+                          currentIsDsd ? "[DSD]" : "[PCM]");
     }
 
     // Rebuffering: hold silence until buffer recovers to threshold
