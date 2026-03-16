@@ -221,8 +221,9 @@ void FfmpegDecoder::convertFrame() {
 }
 
 size_t FfmpegDecoder::readDecoded(int32_t* out, size_t maxFrames) {
-    if (m_error || m_finished) return 0;
+    if (m_error) return 0;
 
+    if (!m_finished) {
     // Lazy init on first call
     if (!m_initialized) {
         if (!initDecoder()) {
@@ -281,6 +282,7 @@ size_t FfmpegDecoder::readDecoded(int32_t* out, size_t maxFrames) {
         }
 
         if (ret == AVERROR_EOF) {
+            LOG_DEBUG("[FFmpeg] AVERROR_EOF received - drain complete");
             m_finished = true;
             break;
         }
@@ -296,10 +298,57 @@ size_t FfmpegDecoder::readDecoded(int32_t* out, size_t maxFrames) {
         // EAGAIN: decoder needs more packets — parse input data
         size_t available = m_inputBuffer.size() - m_inputPos;
         if (available == 0) {
-            if (m_eof) {
-                // Flush decoder
-                avcodec_send_packet(m_codecCtx, nullptr);
-                continue;
+            switch (decideFfmpegEofAction(m_parser != nullptr,
+                                          available,
+                                          m_eof,
+                                          m_parserDrained,
+                                          m_codecDrained)) {
+                case FfmpegEofAction::DrainParser: {
+                    uint8_t* outData = nullptr;
+                    int outSize = 0;
+                    av_parser_parse2(
+                        m_parser, m_codecCtx,
+                        &outData, &outSize,
+                        nullptr, 0,
+                        AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+                    m_parserDrained = true;
+                    LOG_DEBUG("[FFmpeg] DrainParser: outSize=" << outSize);
+
+                    if (outSize > 0) {
+                        m_packet->data = outData;
+                        m_packet->size = outSize;
+                        int sendRet = avcodec_send_packet(m_codecCtx, m_packet);
+                        if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) {
+                            char errbuf[128];
+                            av_strerror(sendRet, errbuf, sizeof(errbuf));
+                            LOG_WARN("[FFmpeg] Send packet error: " << errbuf);
+                        }
+                    }
+                    continue;
+                }
+
+                case FfmpegEofAction::DrainCodec: {
+                    int sendRet = avcodec_send_packet(m_codecCtx, nullptr);
+                    if (sendRet == 0 || sendRet == AVERROR_EOF) {
+                        m_codecDrained = true;
+                        LOG_DEBUG("[FFmpeg] DrainCodec: null packet accepted (sendRet=" << sendRet << ")");
+                    } else if (sendRet == AVERROR(EAGAIN)) {
+                        LOG_DEBUG("[FFmpeg] DrainCodec: EAGAIN - retrying after receive");
+                    } else {
+                        char errbuf[128];
+                        av_strerror(sendRet, errbuf, sizeof(errbuf));
+                        LOG_WARN("[FFmpeg] Flush packet error: " << errbuf);
+                    }
+                    continue;
+                }
+
+                case FfmpegEofAction::None:
+                    LOG_DEBUG("[FFmpeg] EofAction::None - no more data"
+                              " eof=" << m_eof
+                              << " parserDrained=" << m_parserDrained
+                              << " codecDrained=" << m_codecDrained
+                              << " available=" << (m_inputBuffer.size() - m_inputPos));
+                    break;
             }
             break;  // No more data to parse, return what we have
         }
@@ -363,6 +412,8 @@ size_t FfmpegDecoder::readDecoded(int32_t* out, size_t maxFrames) {
         }
     }
 
+    } // end if (!m_finished)
+
     // Copy available output frames
     if (!m_formatReady || m_format.channels == 0) return 0;
 
@@ -399,6 +450,8 @@ void FfmpegDecoder::flush() {
     m_error = false;
     m_finished = false;
     m_eof = false;
+    m_parserDrained = false;
+    m_codecDrained = false;
     m_decodedSamples = 0;
     m_rawPcmConfigured = false;
 }

@@ -10,8 +10,11 @@
 #include "SlimprotoClient.h"
 #include "HttpStreamClient.h"
 #include "Decoder.h"
+#include "DecoderDrainPolicy.h"
+#include "PcmSenderPolicy.h"
+#ifndef NO_DSD
 #include "DsdStreamReader.h"
-#include "DsdProcessor.h"
+#endif
 #include "DirettaSync.h"
 #include "LogLevel.h"
 
@@ -282,7 +285,11 @@ Config parseArguments(int argc, char* argv[]) {
                       << "\n"
                       << "Audio:\n"
                       << "  --max-rate <hz>        Max sample rate (default: 1536000)\n"
+#ifndef NO_DSD
                       << "  --no-dsd               Disable DSD support\n"
+#else
+                      << "  DSD support compiled out at build time\n"
+#endif
                       << "  --decoder <backend>    Decoder backend: native (default), ffmpeg\n"
                       << "\n"
                       << "Logging:\n"
@@ -403,7 +410,10 @@ int main(int argc, char* argv[]) {
 #ifdef ENABLE_FFMPEG
               << " [FFmpeg available]"
 #endif
-              << " DSD" << std::endl;
+#ifndef NO_DSD
+              << " DSD"
+#endif
+              << std::endl;
 
     Config config = parseArguments(argc, argv);
 
@@ -465,7 +475,11 @@ int main(int argc, char* argv[]) {
     std::cout << "  Player:     " << config.playerName << std::endl;
     std::cout << "  Target:     #" << config.direttaTarget << std::endl;
     std::cout << "  Max Rate:   " << config.maxSampleRate << " Hz" << std::endl;
+#ifdef NO_DSD
+    std::cout << "  DSD:        disabled (compile-time)" << std::endl;
+#else
     std::cout << "  DSD:        " << (config.dsdEnabled ? "enabled" : "disabled") << std::endl;
+#endif
     if (!config.macAddress.empty()) {
         std::cout << "  MAC:        " << config.macAddress << std::endl;
     }
@@ -643,6 +657,7 @@ int main(int argc, char* argv[]) {
                     // ============================================================
                     // DSD PATH — separate from PCM/FLAC
                     // ============================================================
+#ifndef NO_DSD
                     if (formatCode == FORMAT_DSD) {
                       // DSD gapless chaining loop
                       char dsdPcmRate = pcmRate;
@@ -907,6 +922,14 @@ int main(int argc, char* argv[]) {
                       audioThreadDone.store(true, std::memory_order_release);
                       return;
                     }
+#else
+                    if (formatCode == FORMAT_DSD) {
+                      LOG_ERROR("[Audio] DSD support is not compiled into this binary");
+                      slimproto->sendStat(StatEvent::STMn);
+                      audioThreadDone.store(true, std::memory_order_release);
+                      return;
+                    }
+#endif
 
                     // ============================================================
                     // PCM/FLAC PATH with gapless chaining
@@ -1154,7 +1177,10 @@ int main(int argc, char* argv[]) {
 
                         // Post-EOF decoder drain.
                         decoder->setEof();
-                        while (!decoder->isFinished() && !decoder->hasError() &&
+                        LOG_DEBUG("[Producer] Post-EOF drain start: finished=" << decoder->isFinished()
+                                  << " error=" << decoder->hasError());
+                        size_t drainIter = 0;
+                        while (!decoder->hasError() &&
                                audioTestRunning.load(std::memory_order_acquire)) {
                             size_t free = cacheFreeFrames();
                             if (free == 0) {
@@ -1163,9 +1189,31 @@ int main(int argc, char* argv[]) {
                             }
                             size_t frames = decoder->readDecoded(
                                 decodeBuf, std::min(MAX_DECODE_FRAMES, free));
-                            if (frames == 0) break;
-                            cachePushFrames(decodeBuf, frames);
+                            if (frames > 0) {
+                                cachePushFrames(decodeBuf, frames);
+                            }
+                            bool finished = decoder->isFinished();
+                            bool error    = decoder->hasError();
+                            bool cont = shouldContinuePostEofDrain(frames, finished, error);
+                            if ((drainIter % 50) == 0 || !cont) {
+                                LOG_DEBUG("[Producer] Drain iter=" << drainIter
+                                          << " frames=" << frames
+                                          << " finished=" << finished
+                                          << " error=" << error
+                                          << " continue=" << cont);
+                            }
+                            ++drainIter;
+                            if (!cont) {
+                                break;
+                            }
+                            if (frames == 0) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
                         }
+                        LOG_DEBUG("[Producer] Post-EOF drain end: iter=" << drainIter
+                                  << " finished=" << decoder->isFinished()
+                                  << " error=" << decoder->hasError()
+                                  << " running=" << audioTestRunning.load());
 
                         if (!prebufferReady.load(std::memory_order_relaxed)) {
                             prebufferReady.store(true, std::memory_order_release);
@@ -1260,11 +1308,16 @@ int main(int argc, char* argv[]) {
 
                         uint64_t seenEpoch = direttaPtr->getPopEpoch();
 
-                        auto sendChunk = [&](size_t frames) {
-                            direttaPtr->sendAudio(
+                        auto sendChunk = [&](size_t frames) -> size_t {
+                            size_t consumedBytes = direttaPtr->sendAudio(
                                 reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
-                            cachePopFrames(frames);
-                            pushedFrames += frames;
+                            size_t acceptedFrames = acceptedFramesFromConsumedPcmBytes(
+                                consumedBytes, detectedChannels);
+                            if (acceptedFrames > 0) {
+                                cachePopFrames(acceptedFrames);
+                                pushedFrames += acceptedFrames;
+                            }
+                            return acceptedFrames;
                         };
 
                         uint32_t rate = snapshotSampleRate;
@@ -1285,11 +1338,53 @@ int main(int argc, char* argv[]) {
                             }
                         };
 
+                        size_t senderIter = 0;
+                        size_t prevDBytes = SIZE_MAX;
+                        int dBytesUnchangedCount = 0;
                         while (audioTestRunning.load(std::memory_order_acquire)) {
-                            if (producerDone.load(std::memory_order_acquire) &&
-                                cacheAvailFrames() == 0) {
+                            bool pDone = producerDone.load(std::memory_order_acquire);
+                            size_t cFrames = cacheAvailFrames();
+                            size_t dBytes  = direttaPtr->getBufferedBytes();
+                            if ((senderIter % 500) == 0) {
+                                LOG_DEBUG("[Sender] iter=" << senderIter
+                                          << " producerDone=" << pDone
+                                          << " cacheFrames=" << cFrames
+                                          << " direttaBytes=" << dBytes);
+                            }
+                            ++senderIter;
+                            if (shouldDeclareNaturalPcmEnd(pDone, cFrames, dBytes)) {
+                                LOG_DEBUG("[Sender] Natural stream end declared"
+                                          << " iter=" << senderIter
+                                          << " producerDone=" << pDone
+                                          << " cacheFrames=" << cFrames
+                                          << " direttaBytes=" << dBytes);
                                 naturalStreamEnd.store(true, std::memory_order_release);
                                 break;
+                            }
+
+                            // Stuck detection: when cache is empty and producer is done,
+                            // the SDK may enter underrun mode (avail < bytesPerBuffer) and
+                            // stop consuming from the ring buffer — filling silence instead.
+                            // direttaBytes then never reaches 0, causing shouldDeclareNaturalPcmEnd
+                            // to never return true and the sender to loop forever.
+                            // After ~20ms of no change we declare natural end; the stuck bytes
+                            // (<1 SDK buffer, <1ms of audio) have already been replaced by silence.
+                            if (pDone && cFrames == 0) {
+                                if (dBytes == prevDBytes) {
+                                    if (++dBytesUnchangedCount >= 10) {
+                                        LOG_DEBUG("[Sender] Natural stream end declared"
+                                                  " (ring buffer stuck at " << dBytes
+                                                  << " bytes, SDK underrun mode)");
+                                        naturalStreamEnd.store(true, std::memory_order_release);
+                                        break;
+                                    }
+                                } else {
+                                    dBytesUnchangedCount = 0;
+                                }
+                                prevDBytes = dBytes;
+                            } else {
+                                prevDBytes = SIZE_MAX;
+                                dBytesUnchangedCount = 0;
                             }
 
                             {
@@ -1327,7 +1422,9 @@ int main(int argc, char* argv[]) {
                                           RECOVERY_CHUNK_MAX_FRAMES)
                                     : RECOVERY_CHUNK_MIN_FRAMES;
                                 size_t contiguous = cacheContiguousFrames();
-                                if (contiguous > 0) sendChunk(std::min(contiguous, chunkFrames));
+                                if (contiguous > 0) {
+                                    sendChunk(std::min(contiguous, chunkFrames));
+                                }
                             } else {
                                 size_t steadyChunkFrames = (rate > 0)
                                     ? std::clamp(

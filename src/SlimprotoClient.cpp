@@ -589,9 +589,11 @@ std::string SlimprotoClient::buildCapabilities() const {
 #ifdef ENABLE_AAC
     caps << ",aac";
 #endif
+#ifndef NO_DSD
     if (m_config.dsdEnabled) {
         caps << ",dsf,dff";  // DSD container formats recognized by LMS
     }
+#endif
 
     // Features — also comma-separated key=value pairs
     // LMS SqueezePlay::updateCapabilities() parses these via split(',')

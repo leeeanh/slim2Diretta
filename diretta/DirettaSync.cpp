@@ -1524,6 +1524,12 @@ float DirettaSync::getBufferLevel() const {
     return static_cast<float>(m_ringBuffer.getAvailable()) / static_cast<float>(size);
 }
 
+size_t DirettaSync::getBufferedBytes() const {
+    RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
+    if (!ringGuard.active()) return 0;
+    return m_ringBuffer.getAvailable();
+}
+
 void DirettaSync::dumpStats() const {
     std::cout << "\n════════════════════════════════════════" << std::endl;
     std::cout << "[DirettaSync] Runtime Statistics" << std::endl;

@@ -18,6 +18,7 @@
 #define SLIM2DIRETTA_FFMPEG_DECODER_H
 
 #include "Decoder.h"
+#include "FfmpegEofPolicy.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -84,6 +85,8 @@ private:
     bool m_initialized = false;
     bool m_error = false;
     bool m_finished = false;
+    bool m_parserDrained = false;
+    bool m_codecDrained = false;
     uint64_t m_decodedSamples = 0;
 };
 

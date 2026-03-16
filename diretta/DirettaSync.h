@@ -401,6 +401,7 @@ public:
     size_t sendAudio(const uint8_t* data, size_t numSamples);
 
     float getBufferLevel() const;
+    size_t getBufferedBytes() const;
     const AudioFormat& getFormat() const { return m_currentFormat; }
     void dumpStats() const;
 
