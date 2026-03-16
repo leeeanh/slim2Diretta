@@ -7,6 +7,7 @@
 #   make ARCH_NAME=x64-linux-15v3
 #   make DIRETTA_SDK_PATH=/path/to/DirettaHostSDK_148
 #   make ENABLE_MP3=0 ENABLE_OGG=0 ENABLE_AAC=0
+#   make ENABLE_DSD=0
 
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -O2
@@ -193,10 +194,16 @@ endif
 ENABLE_MP3 ?= auto
 ENABLE_OGG ?= auto
 ENABLE_AAC ?= auto
+ENABLE_DSD ?= 1
+
+ifeq ($(filter 0 1,$(ENABLE_DSD)),)
+$(error ENABLE_DSD must be 0 or 1)
+endif
 
 HAVE_MP3 := 0
 HAVE_OGG := 0
 HAVE_AAC := 0
+HAVE_DSD := 1
 
 ifneq ($(ENABLE_MP3),0)
 ifeq ($(HAVE_PKG_CONFIG),1)
@@ -270,15 +277,27 @@ CORE_SOURCES := \
 	src/SlimprotoClient.cpp \
 	src/HttpStreamClient.cpp \
 	src/Decoder.cpp \
+	src/DecoderDrainPolicy.cpp \
+	src/PcmSenderPolicy.cpp \
+	src/FfmpegEofPolicy.cpp \
 	src/FlacDecoder.cpp \
 	src/PcmDecoder.cpp \
 	src/FfmpegDecoder.cpp \
-	src/DsdProcessor.cpp \
-	src/DsdStreamReader.cpp \
 	diretta/DirettaSync.cpp \
 	diretta/globals.cpp
 
+DSD_SOURCES := \
+	src/DsdProcessor.cpp \
+	src/DsdStreamReader.cpp
+
 SOURCES := $(CORE_SOURCES)
+
+ifeq ($(ENABLE_DSD),0)
+HAVE_DSD := 0
+CPPFLAGS += -DNO_DSD
+else
+SOURCES += $(DSD_SOURCES)
+endif
 
 ifeq ($(HAVE_MP3),1)
 SOURCES += src/Mp3Decoder.cpp
@@ -410,6 +429,12 @@ else
 AAC_STATUS := DISABLED (fdk-aac not found)
 endif
 
+ifeq ($(HAVE_DSD),1)
+DSD_STATUS := ENABLED
+else
+DSD_STATUS := DISABLED (compile-time)
+endif
+
 FFMPEG_STATUS := ENABLED (direct Makefile linkage)
 
 ifeq ($(HAVE_FLAC),1)
@@ -475,6 +500,7 @@ info:
 	@echo "  MP3:            $(MP3_STATUS)"
 	@echo "  Ogg Vorbis:     $(OGG_STATUS)"
 	@echo "  AAC:            $(AAC_STATUS)"
+	@echo "  DSD:            $(DSD_STATUS)"
 	@echo "  FFmpeg:         $(FFMPEG_STATUS)"
 	@echo "Build:"
 	@echo "  Compiler:       $(CXX)"

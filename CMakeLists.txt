@@ -467,6 +467,9 @@ set(SLIM2DIRETTA_SOURCES
     src/SlimprotoClient.cpp
     src/HttpStreamClient.cpp
     src/Decoder.cpp
+    src/DecoderDrainPolicy.cpp
+    src/PcmSenderPolicy.cpp
+    src/FfmpegEofPolicy.cpp
     src/FlacDecoder.cpp
     src/PcmDecoder.cpp
     src/DsdProcessor.cpp
