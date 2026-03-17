@@ -301,9 +301,40 @@ Same pattern as Step 3, at line ~623–625:
                 DIRETTA::Sync::close();
 ```
 
-### Step 5: Drain after worker join in the PCM→DSD full-reset branch
+### Step 5: Drain after worker join in the PCM→DSD `needsFullReset` branch
 
-Find the third `m_workerThread.join()` block (the PCM→DSD `needsFullReset` branch, around line 684–687). Apply the same pattern as Steps 3 and 4.
+Find the third `m_workerThread.join()` block (the PCM→DSD `needsFullReset` branch, around line 684–689). Apply the same pattern as Steps 3 and 4.
+
+### Step 5b: Drain after worker join in the full-teardown branch
+
+There is a fourth `m_workerThread.join()` in the `else` branch at line 711 (`"Format change - full teardown"`, the different-clock-family / low-rate path). Find it (around line 723–728):
+
+```cpp
+                    {
+                        std::lock_guard<std::mutex> lock(m_workerMutex);
+                        if (m_workerThread.joinable()) {
+                            m_workerThread.join();
+                        }
+                    }
+
+                    // Now safe to close SDK - worker thread is stopped
+                    DIRETTA::Sync::close();
+```
+
+Add drain immediately after the closing brace of the `lock_guard` block:
+
+```cpp
+                    {
+                        std::lock_guard<std::mutex> lock(m_workerMutex);
+                        if (m_workerThread.joinable()) {
+                            m_workerThread.join();
+                        }
+                    }
+                    drainPopSem();
+
+                    // Now safe to close SDK - worker thread is stopped
+                    DIRETTA::Sync::close();
+```
 
 ### Step 6: Build
 

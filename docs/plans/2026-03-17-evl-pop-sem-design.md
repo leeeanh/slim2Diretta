@@ -77,7 +77,8 @@ lifetime.
 | Fast path (same format) | `stop()` at line 497 | after `stop()` |
 | DSD→PCM / DSD rate change | `m_workerThread.join()` at line 575 | after join |
 | PCM rate change | `m_workerThread.join()` at line 625 | after join |
-| PCM→DSD full reset | corresponding `m_workerThread.join()` | after join |
+| PCM→DSD `needsFullReset` | `m_workerThread.join()` ~line 689 | after join |
+| Full teardown (`else` branch, line 711) | `m_workerThread.join()` at line 726 | after join |
 
 `drainPopSem()`: calls `evl_timedwait_sem()` in a zero-timeout loop until it returns
 `-EAGAIN`. No sender is running at these points, so there is no concurrent wait.
