@@ -101,8 +101,10 @@ bool DirettaSync::ensurePopSemCreated() {
 void DirettaSync::drainPopSem() {
 #ifdef HAVE_EVL
     if (!m_popSemReady) return;
-    struct timespec zero = {0, 0};
-    while (evl_timedget_sem(&m_popSem, &zero) == 0) {}
+    int drained = 0;
+    while (evl_tryget_sem(&m_popSem) == 0) { ++drained; }
+    if (drained > 0)
+        std::cerr << "[DirettaSync] drainPopSem: drained " << drained << " stale post(s)" << std::endl;
 #endif
 }
 
@@ -470,8 +472,14 @@ bool DirettaSync::open(const AudioFormat& format) {
               << format.bitDepth << "bit/" << format.channels << "ch "
               << (format.isDSD ? "DSD" : "PCM") << std::endl;
 
+    std::cerr << "[DirettaSync] open: ensurePopSemCreated..." << std::endl;
     ensurePopSemCreated();
-    if (!m_open) drainPopSem();
+    std::cerr << "[DirettaSync] open: ensurePopSemCreated done (ready=" << m_popSemReady << ")" << std::endl;
+    if (!m_open) {
+        std::cerr << "[DirettaSync] open: drainPopSem (cold start)..." << std::endl;
+        drainPopSem();
+        std::cerr << "[DirettaSync] open: drainPopSem done" << std::endl;
+    }
 
     if (!m_enabled) {
         std::cerr << "[DirettaSync] ERROR: Not enabled" << std::endl;
