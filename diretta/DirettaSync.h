@@ -30,6 +30,10 @@
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
+#ifdef HAVE_EVL
+#include <evl/sem.h>
+#include <ctime>
+#endif
 
 //=============================================================================
 // Lock-free Log Ring Buffer (for non-blocking logging in hot paths)
@@ -468,6 +472,34 @@ public:
      */
     void notifySpaceAvailable() {
         m_spaceAvailable.notify_one();
+#ifdef HAVE_EVL
+        if (m_popSemReady)
+            evl_post_sem(&m_popSem);
+#endif
+    }
+
+    bool isPopSemReady() const {
+#ifdef HAVE_EVL
+        return m_popSemReady;
+#else
+        return false;
+#endif
+    }
+
+    void waitForPop(std::chrono::milliseconds timeout) {
+#ifdef HAVE_EVL
+        if (m_popSemReady) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            ts.tv_nsec += timeout.count() * 1'000'000LL;
+            if (ts.tv_nsec >= 1'000'000'000LL) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1'000'000'000LL;
+            }
+            evl_timedwait_sem(&m_popSem, &ts);
+            return;
+        }
+#endif
     }
 
     /**
@@ -541,6 +573,8 @@ private:
     void requestShutdownSilence(int buffers);
     bool waitForOnline(unsigned int timeoutMs);
     void logSinkCapabilities();
+    bool ensurePopSemCreated();
+    void drainPopSem();
 
     class ReconfigureGuard {
     public:
@@ -594,6 +628,10 @@ private:
     // without burning CPU or introducing 5ms sleep jitter
     std::mutex m_flowMutex;
     std::condition_variable m_spaceAvailable;
+#ifdef HAVE_EVL
+    struct evl_sem m_popSem {};
+    bool m_popSemReady = false;
+#endif
 
     // G1: Condition variable for interruptible format transition waits
     // Allows blocking waits to be interrupted on shutdown rather than sleeping
