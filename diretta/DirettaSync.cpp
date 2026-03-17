@@ -1835,6 +1835,7 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
 #ifdef HAVE_EVL
     if (m_popSemReady) {
         evl_put_sem(&m_popSem);
+        m_spaceAvailable.notify_one();
     } else {
 #endif
     // G1: Signal producer that space is now available
