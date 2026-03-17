@@ -464,6 +464,9 @@ bool DirettaSync::open(const AudioFormat& format) {
               << format.bitDepth << "bit/" << format.channels << "ch "
               << (format.isDSD ? "DSD" : "PCM") << std::endl;
 
+    ensurePopSemCreated();
+    if (!m_open) drainPopSem();
+
     if (!m_enabled) {
         std::cerr << "[DirettaSync] ERROR: Not enabled" << std::endl;
         return false;
@@ -521,6 +524,7 @@ bool DirettaSync::open(const AudioFormat& format) {
             // pause/unpause work reliably. Prevents getNewStream() calls
             // so clear() has no concurrent access.
             stop();
+            drainPopSem();
 
             // Clear buffer and reset flags
             // NOTE: Do NOT reset m_postOnlineDelayDone for quick resume!
@@ -600,6 +604,7 @@ bool DirettaSync::open(const AudioFormat& format) {
                         m_workerThread.join();
                     }
                 }
+                drainPopSem();
 
                 // Now safe to close SDK - worker thread is stopped
                 DIRETTA::Sync::close();
@@ -651,6 +656,7 @@ bool DirettaSync::open(const AudioFormat& format) {
                         m_workerThread.join();
                     }
                 }
+                drainPopSem();
 
                 // Now safe to close SDK - worker thread is stopped
                 DIRETTA::Sync::close();
@@ -715,6 +721,7 @@ bool DirettaSync::open(const AudioFormat& format) {
                             m_workerThread.join();
                         }
                     }
+                    drainPopSem();
 
                     // Now safe to close SDK - worker thread is stopped
                     DIRETTA::Sync::close();
@@ -752,6 +759,7 @@ bool DirettaSync::open(const AudioFormat& format) {
                             m_workerThread.join();
                         }
                     }
+                    drainPopSem();
 
                     // Now safe to close SDK - worker thread is stopped
                     DIRETTA::Sync::close();
