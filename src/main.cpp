@@ -1405,15 +1405,23 @@ int main(int argc, char* argv[]) {
                                 dBytesUnchangedCount = 0;
                             }
 
-                            {
-                                std::unique_lock<std::mutex> lock(direttaPtr->getFlowMutex());
-                                direttaPtr->waitForSpace(lock,
-                                    [&]() {
-                                        return direttaPtr->getPopEpoch() != seenEpoch ||
-                                               !audioTestRunning.load(std::memory_order_acquire);
-                                    },
-                                    std::chrono::milliseconds(2));
+#ifdef HAVE_EVL
+                            if (direttaPtr->isPopSemReady()) {
+                                direttaPtr->waitForPop(std::chrono::milliseconds(2));
+                            } else {
+#endif
+                                {
+                                    std::unique_lock<std::mutex> lock(direttaPtr->getFlowMutex());
+                                    direttaPtr->waitForSpace(lock,
+                                        [&]() {
+                                            return direttaPtr->getPopEpoch() != seenEpoch ||
+                                                   !audioTestRunning.load(std::memory_order_acquire);
+                                        },
+                                        std::chrono::milliseconds(2));
+                                }
+#ifdef HAVE_EVL
                             }
+#endif
                             seenEpoch = direttaPtr->getPopEpoch();
 
                             if (direttaPtr->isPaused()) {
