@@ -13,6 +13,7 @@
 #include <sched.h>
 #ifdef HAVE_EVL
 #include <evl/thread.h>
+#include <unistd.h>
 #endif
 
 // F1: Thread priority elevation for reduced jitter
@@ -77,6 +78,31 @@ bool attachEvlThread(const char* name) {
 #else
     (void)name;
     return true;
+#endif
+}
+
+bool DirettaSync::ensurePopSemCreated() {
+#ifdef HAVE_EVL
+    if (m_popSemReady) return true;
+    int ret = evl_new_sem(&m_popSem, "/slim2diretta-pop-%d", getpid());
+    if (ret < 0) {
+        std::cerr << "[DirettaSync] Warning: evl_new_sem failed (ret=" << ret
+                  << ") - falling back to condvar for pop-epoch wait" << std::endl;
+        return false;
+    }
+    m_popSemReady = true;
+    DIRETTA_LOG("EVL pop semaphore created");
+    return true;
+#else
+    return false;
+#endif
+}
+
+void DirettaSync::drainPopSem() {
+#ifdef HAVE_EVL
+    if (!m_popSemReady) return;
+    struct timespec zero = {0, 0};
+    while (evl_timedwait_sem(&m_popSem, &zero) == 0) {}
 #endif
 }
 
