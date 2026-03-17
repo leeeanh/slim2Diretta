@@ -54,14 +54,23 @@ for its lifecycle.
 
 **Creation**: `ensurePopSemCreated()` — a private method called at `open()` entry, before
 the fast-path / slow-path branches. It is idempotent: a no-op if `m_popSemReady` is
-already true. On first call it calls `evl_new_sem()` with initial count 0. If
-`evl_new_sem()` succeeds, sets `m_popSemReady = true`. If it fails, logs a warning,
-leaves `m_popSemReady = false`, and all three gated sites fall back to the condvar path
-for the rest of the process lifetime.
+already true. On first call it calls `evl_new_sem()` with initial count 0. The semaphore
+name embeds `getpid()` — `/slim2diretta-pop-%d` — to avoid colliding with a second
+process instance in the global EVL namespace. If `evl_new_sem()` succeeds, sets
+`m_popSemReady = true`. If it fails, logs a warning, leaves `m_popSemReady = false`,
+and all three gated sites fall back to the condvar path for the rest of the process
+lifetime.
 
 **Drain after quiesce**: Old playback can still be generating `getNewStream()` posts until
-`stop()` is reached inside `open()`. To avoid a race, the sem is not drained at `open()`
-entry. Instead, `drainPopSem()` is called after each branch's quiesce point:
+`stop()` is reached inside `open()`. The drain strategy has two layers:
+
+1. **Entry drain when `!m_open`**: When `open()` is called after the SDK was fully
+   released (e.g., after playlist end), `m_open` is false and no `getNewStream()` is
+   running. In that state, stale stop/flush posts from the prior session may remain in
+   the sem. `drainPopSem()` is called immediately after `ensurePopSemCreated()` in this
+   case (`if (!m_open) drainPopSem()`).
+
+2. **Transition-time quiesce drains** when `m_open` is true (live session transitioning):
 
 | Branch | Quiesce point | Drain after |
 |--------|---------------|-------------|
@@ -134,7 +143,7 @@ void notifySpaceAvailable() {
 bool DirettaSync::ensurePopSemCreated() {
 #ifdef HAVE_EVL
     if (m_popSemReady) return true;
-    int ret = evl_new_sem(&m_popSem, "/slim2diretta-pop");
+    int ret = evl_new_sem(&m_popSem, "/slim2diretta-pop-%d", getpid());
     if (ret < 0) {
         std::cerr << "[DirettaSync] Warning: evl_new_sem failed (" << ret
                   << ") — falling back to condvar for pop-epoch wait" << std::endl;
