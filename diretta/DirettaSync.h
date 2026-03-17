@@ -491,7 +491,9 @@ public:
         if (m_popSemReady) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
-            ts.tv_nsec += timeout.count() * 1'000'000LL;
+            long long timeoutNs = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
+            ts.tv_sec += timeoutNs / 1'000'000'000LL;
+            ts.tv_nsec += timeoutNs % 1'000'000'000LL;
             if (ts.tv_nsec >= 1'000'000'000LL) {
                 ts.tv_sec++;
                 ts.tv_nsec -= 1'000'000'000LL;
@@ -500,6 +502,7 @@ public:
             return;
         }
 #endif
+        std::this_thread::sleep_for(timeout);
     }
 
     /**
