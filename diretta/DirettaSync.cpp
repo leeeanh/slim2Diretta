@@ -1826,6 +1826,11 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
     // detect pops even when it holds the mutex (avoiding lost wakeups)
     m_popEpoch.fetch_add(1, std::memory_order_release);
 
+#ifdef HAVE_EVL
+    if (m_popSemReady) {
+        evl_post_sem(&m_popSem);
+    } else {
+#endif
     // G1: Signal producer that space is now available
     // Use try_lock to avoid blocking the time-critical consumer thread
     // If producer isn't waiting, this is a no-op (harmless notification)
@@ -1833,6 +1838,9 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
         m_flowMutex.unlock();
         m_spaceAvailable.notify_one();
     }
+#ifdef HAVE_EVL
+    }
+#endif
 
     m_workerActive = false;
     return true;
