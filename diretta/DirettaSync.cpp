@@ -102,7 +102,7 @@ void DirettaSync::drainPopSem() {
 #ifdef HAVE_EVL
     if (!m_popSemReady) return;
     struct timespec zero = {0, 0};
-    while (evl_timedwait_sem(&m_popSem, &zero) == 0) {}
+    while (evl_timedget_sem(&m_popSem, &zero) == 0) {}
 #endif
 }
 
@@ -1834,7 +1834,7 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
 
 #ifdef HAVE_EVL
     if (m_popSemReady) {
-        evl_post_sem(&m_popSem);
+        evl_put_sem(&m_popSem);
     } else {
 #endif
     // G1: Signal producer that space is now available

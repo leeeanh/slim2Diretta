@@ -32,7 +32,6 @@
 #include <condition_variable>
 #ifdef HAVE_EVL
 #include <evl/sem.h>
-#include <ctime>
 #endif
 
 //=============================================================================
@@ -474,7 +473,7 @@ public:
         m_spaceAvailable.notify_one();
 #ifdef HAVE_EVL
         if (m_popSemReady)
-            evl_post_sem(&m_popSem);
+            evl_put_sem(&m_popSem);
 #endif
     }
 
@@ -489,16 +488,12 @@ public:
     void waitForPop(std::chrono::milliseconds timeout) {
 #ifdef HAVE_EVL
         if (m_popSemReady) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
             long long timeoutNs = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
-            ts.tv_sec += timeoutNs / 1'000'000'000LL;
-            ts.tv_nsec += timeoutNs % 1'000'000'000LL;
-            if (ts.tv_nsec >= 1'000'000'000LL) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1'000'000'000LL;
-            }
-            evl_timedwait_sem(&m_popSem, &ts);
+            struct timespec ts = {
+                static_cast<time_t>(timeoutNs / 1'000'000'000LL),
+                static_cast<long>(timeoutNs % 1'000'000'000LL)
+            };
+            evl_timedget_sem(&m_popSem, &ts);
             return;
         }
 #endif
