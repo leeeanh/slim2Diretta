@@ -165,6 +165,12 @@ DirettaSync::DirettaSync() {
 
 DirettaSync::~DirettaSync() {
     disable();
+#ifdef HAVE_EVL
+    if (m_popSemReady) {
+        evl_close_sem(&m_popSem);
+        m_popSemReady = false;
+    }
+#endif
     DIRETTA_LOG("Destroyed");
 }
 
