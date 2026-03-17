@@ -560,12 +560,12 @@ sudo ./slim2diretta -s <lms-ip> --target 1 -v
 ```
 
 Expected:
-- `[DirettaSync] EVL pop semaphore created` appears at stream open.
+- `[DirettaSync] EVL pop semaphore created` appears once on the first stream open and not again on subsequent opens (semaphore is created once per process lifetime, then reused).
 - Playback starts without underruns on a 44.1 kHz FLAC track.
 - No `evl_new_sem failed` warning.
 - `sendAudio` and `getNewStream` trace messages appear in the async log (use `-v`).
-- Play a 48 kHz track immediately after to exercise the fast-path (same-format) drain.
-- Play a DSD track after PCM to exercise the slow-path drain.
+- Queue two consecutive tracks of the same format (e.g., two 44.1 kHz FLAC files) to exercise the fast-path (same-format quick-resume) drain — no stale wakes, no underrun at the transition.
+- Queue a DSD track after PCM (or change to a different sample rate) to exercise the slow-path drain.
 
 ### Step 6: Commit
 
@@ -591,11 +591,11 @@ sudo ./slim2diretta -s <lms-ip> --target 1 -v --rt-cpu 3
 ```
 
 Checklist:
-- `EVL pop semaphore created` log line appears exactly once per `open()`.
+- `EVL pop semaphore created` log line appears exactly once per process run, on the first `open()` only — not on subsequent opens.
 - No `evl_new_sem failed` warnings.
 - Play 30+ minutes of 44.1 kHz FLAC — zero underruns.
-- Track-to-track gapless transition (same format) — drainPopSem fires on fast path, no stale wakes.
-- Format change (e.g., PCM → DSD or 44.1 → 96 kHz) — drainPopSem fires on slow path, clean open.
+- Same-format gapless transition (two tracks at identical rate/depth/channels) — fast path fires, drainPopSem runs after `stop()`, no stale wakes, no underrun.
+- Format change (e.g., PCM → DSD or 44.1 kHz → 96 kHz) — slow-path branch fires, drainPopSem runs after worker join, clean open.
 - `SIGINT` / stop command — sender exits promptly (not delayed 2 ms by sem timeout).
 
 Verify no regression with EVL disabled:
