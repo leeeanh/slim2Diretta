@@ -96,6 +96,7 @@ lifetime.
 ```cpp
 #ifdef HAVE_EVL
 #include <evl/sem.h>
+#include <ctime>       // timespec, clock_gettime, CLOCK_MONOTONIC (used by waitForPop)
     struct evl_sem m_popSem {};
     bool m_popSemReady = false;
 #endif
@@ -139,7 +140,7 @@ void notifySpaceAvailable() {
 
 ### `diretta/DirettaSync.cpp`
 
-**`ensurePopSemCreated()` implementation:**
+**`ensurePopSemCreated()` implementation** (in `DirettaSync.cpp`, which must add `#include <unistd.h>` inside the `HAVE_EVL` block for `getpid()`):
 ```cpp
 bool DirettaSync::ensurePopSemCreated() {
 #ifdef HAVE_EVL

@@ -22,6 +22,7 @@ Find the `HAVE_EVL` include for `evl/thread.h` that was added in the last commit
 ```cpp
 #ifdef HAVE_EVL
 #include <evl/sem.h>
+#include <ctime>       // timespec, clock_gettime, CLOCK_MONOTONIC (used by waitForPop)
 #endif
 ```
 
@@ -128,15 +129,21 @@ sender from evl_timedwait_sem() without touching call sites."
 **Files:**
 - Modify: `diretta/DirettaSync.cpp`
 
-### Step 1: Verify `evl/thread.h` is already included
+### Step 1: Verify `evl/thread.h` is already included and add `<unistd.h>`
 
 The existing `attachEvlThread()` added `#include <evl/thread.h>` at line 14–16 of `DirettaSync.cpp` under `HAVE_EVL`. Verify it is there:
 
 ```bash
-grep -n "evl/thread\|HAVE_EVL" diretta/DirettaSync.cpp | head -5
+grep -n "evl/thread\|HAVE_EVL\|unistd" diretta/DirettaSync.cpp | head -8
 ```
 
-Expected: lines showing `#ifdef HAVE_EVL` and `#include <evl/thread.h>`.
+Expected: lines showing `#ifdef HAVE_EVL` and `#include <evl/thread.h>`. If `<unistd.h>` is not already present, add it inside the same `#ifdef HAVE_EVL` block — `getpid()` is declared there:
+
+```cpp
+#ifdef HAVE_EVL
+#include <evl/thread.h>
+#include <unistd.h>    // getpid() for per-process semaphore name
+```
 
 ### Step 2: Add `ensurePopSemCreated()` implementation
 
