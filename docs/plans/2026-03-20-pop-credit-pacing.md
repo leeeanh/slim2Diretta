@@ -31,32 +31,47 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     bool isRebuffering() const {
         return m_rebuffering.load(std::memory_order_acquire);
     }
+
+    // Returns the per-frame byte count that matches sendAudio()'s return value.
+    // sendAudio() is inconsistent: conversion paths (pack24bit, push16To32, push16To24)
+    // return input bytes consumed; the direct PCM copy path returns sink bytes written.
+    // On 16-bit sinks (direttaBps=2, inputBps=4), the direct path returns frames×ch×2,
+    // so acceptedFramesFromConsumedPcmBytes(÷4) would undercount by 2x.
+    // Using this accessor in sendChunk() gives the correct divisor for all cases.
+    int getConsumedBytesPerFrame() const {
+        int channels = m_channels.load(std::memory_order_acquire);
+        if (m_need24BitPack.load(std::memory_order_acquire) ||
+            m_need16To32Upsample.load(std::memory_order_acquire) ||
+            m_need16To24Upsample.load(std::memory_order_acquire)) {
+            return m_inputBytesPerSample.load(std::memory_order_acquire) * channels;
+        }
+        return m_bytesPerSample.load(std::memory_order_acquire) * channels;
+    }
 ```
 
 The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
 
 `m_poppedFramesTotal` uses `alignas(64)` to give it its own cache line, matching `m_popEpoch` at line 525. `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getSinkBytesPerFrame()` is **not** added. `sendAudio()` consistently returns input bytes
-consumed (not sink bytes): `push24BitPacked()` returns `samplesWritten * 4` (int32_t units)
-regardless of sink depth. Since `audioFmt.bitDepth` is forced to 32 in main.cpp, the decode
-cache is always int32_t for all paths that reach `sendChunk()`. The existing
-`acceptedFramesFromConsumedPcmBytes(consumedBytes, detectedChannels)` dividing by
-`channels * sizeof(int32_t)` is therefore correct — no change to `sendChunk()` is required.
+`getConsumedBytesPerFrame()` reads existing atomics (`m_channels`, `m_need24BitPack`,
+`m_need16To32Upsample`, `m_need16To24Upsample`, `m_inputBytesPerSample`, `m_bytesPerSample`
+— all already declared in DirettaSync.h). No new state is added.
 
 **Step 2: Verify it compiles**
 
 ```bash
-cd /path/to/slim2Diretta/build && make -j$(nproc) 2>&1 | head -40
+cd /path/to/slim2Diretta/build && make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+    && echo "Build OK" \
+    || { tail -20 /tmp/slim2d_build.log; echo "Build FAILED"; exit 1; }
 ```
 
-Expected: clean build, no new warnings.
+Expected: "Build OK", no new warnings in the log.
 
 **Step 3: Commit**
 
 ```bash
 git add diretta/DirettaSync.h
-git commit -m "feat(diretta): add m_poppedFramesTotal frame credit counter and accessors"
+git commit -m "feat(diretta): add m_poppedFramesTotal, isRebuffering, getConsumedBytesPerFrame"
 ```
 
 ---
@@ -179,16 +194,51 @@ retries even under load.
 `firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()`
 which covers both the initial startup window and the post-resume re-prefill.
 
-`sendChunk()` is **not changed**. `sendAudio()` consistently returns input bytes consumed
-(not sink bytes): `push24BitPacked()` returns `samplesWritten * 4` (int32_t units). Since
-`audioFmt.bitDepth` is forced to 32, the cache is always int32_t for all paths that reach
-`sendChunk()`, so `acceptedFramesFromConsumedPcmBytes(consumedBytes, detectedChannels)`
-dividing by `channels * sizeof(int32_t)` is correct for all supported sink depths.
+**Step 3: Fix `sendChunk()` to use `getConsumedBytesPerFrame()`**
 
-**Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
+The `sendChunk` lambda at line 1329 currently reads:
+
+```cpp
+                        auto sendChunk = [&](size_t frames) -> size_t {
+                            size_t consumedBytes = direttaPtr->sendAudio(
+                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
+                            size_t acceptedFrames = acceptedFramesFromConsumedPcmBytes(
+                                consumedBytes, detectedChannels);
+                            if (acceptedFrames > 0) {
+                                cachePopFrames(acceptedFrames);
+                                pushedFrames += acceptedFrames;
+                            }
+                            return acceptedFrames;
+                        };
+```
+
+`acceptedFramesFromConsumedPcmBytes()` divides by `channels × sizeof(int32_t)`. For 16-bit
+sinks, `sendAudio()`'s direct PCM path returns `frames × channels × 2` (sink bytes), so
+the division gives `frames / 2` — the decode-cache read pointer and `seenPoppedFramesTotal`
+both fall behind, recreating drift. Replace with `getConsumedBytesPerFrame()` (added Task 1):
+
+```cpp
+                        auto sendChunk = [&](size_t frames) -> size_t {
+                            size_t consumedBytes = direttaPtr->sendAudio(
+                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
+                            int cbpf = direttaPtr->getConsumedBytesPerFrame();
+                            size_t acceptedFrames = (cbpf > 0)
+                                ? consumedBytes / static_cast<size_t>(cbpf)
+                                : 0;
+                            if (acceptedFrames > 0) {
+                                cachePopFrames(acceptedFrames);
+                                pushedFrames += acceptedFrames;
+                            }
+                            return acceptedFrames;
+                        };
+```
+
+**Step 4: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
 ```bash
-make -j$(nproc) 2>&1 | grep "error:"
+make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+    && echo "Build OK" \
+    || { grep "error:" /tmp/slim2d_build.log | head -20; echo "Build FAILED"; exit 1; }
 ```
 
 Expected: errors referencing `senderMode`, `STEADY_ENTER`, etc. — fixed in Task 4.
@@ -306,13 +356,32 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                             // else: no credits, not in an exceptional state — wait for next pop.
 ```
 
-**Step 2: Verify it compiles cleanly**
+**Step 2: Remove the now-duplicate `updateElapsed()` call at line 1471**
 
-```bash
-make -j$(nproc) 2>&1 | head -40
+The replacement block in Step 1 adds `updateElapsed()` before the credit/recovery branch.
+The original code has a second call at lines 1470–1472, immediately after the replaced block:
+
+```cpp
+                            if (audioFmtReady.load(std::memory_order_relaxed)) {
+                                updateElapsed();
+                            }
 ```
 
-Expected: zero errors and zero new warnings. The `senderMode`, `STEADY_ENTER`, etc. references from the old controller were the only consumers of the removed declarations.
+This line is **outside** the replaced range (1425–1468), so it stays unless explicitly removed.
+With both calls present, `updateElapsed()` would fire twice per non-paused wakeup (once in
+the new block, once from this leftover), doubling the progress-reporting cadence.
+
+Delete those three lines (the `if (audioFmtReady...) { updateElapsed(); }` block at 1470–1472).
+
+**Step 3: Verify it compiles cleanly**
+
+```bash
+make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+    && echo "Build OK" \
+    || { grep "error:" /tmp/slim2d_build.log | head -20; echo "Build FAILED"; exit 1; }
+```
+
+Expected: "Build OK", zero new warnings. The `senderMode`, `STEADY_ENTER`, etc. references from the old controller were the only consumers of the removed declarations.
 
 **Step 3: Commit**
 

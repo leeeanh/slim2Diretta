@@ -73,13 +73,47 @@ bool isRebuffering() const {
 `getBytesPerBuffer()` and `getFramesPerBuffer()` are not needed: the sender uses frame credits
 directly and does not re-derive the SDK frame quantum.
 
-`getSinkBytesPerFrame()` is **not** needed. `sendAudio()` consistently returns **input bytes
-consumed** (not sink bytes written): `push24BitPacked()` returns `samplesWritten * 4` (input
-int32_t units); the direct push returns `frames × channels × 4`. Because `audioFmt.bitDepth`
-is forced to 32 (main.cpp line 1157) for all PCM inputs (DoP is also packed as int32_t-aligned
-frames), the decode cache is always int32_t for all paths that reach `sendChunk()`. The
-existing `acceptedFramesFromConsumedPcmBytes()` dividing by `channels × sizeof(int32_t)` is
-therefore correct across all supported sink bit depths — no change to `sendChunk()` is required.
+`sendAudio()` has inconsistent return conventions across paths:
+- **Conversion paths** (`pack24bit`, `push16To32`, `push16To24`): return **input bytes consumed**
+  (`samplesWritten × inputBps × channels`).
+- **Direct path** (else branch): returns **sink bytes written** (`frames × direttaBps × channels`).
+
+For 32-bit sinks (direttaBps = inputBps = 4), the two are the same. For 16-bit sinks
+(direttaBps = 2, inputBps = 4 — from `int inputBps = (bitDepth == 32) ? 4 : 2` at line 850
+of DirettaSync.cpp), the direct path returns `frames × channels × 2`, and
+`acceptedFramesFromConsumedPcmBytes()` dividing by `channels × 4` undercounts by 2x.
+
+Add a `getConsumedBytesPerFrame()` accessor to expose the correct per-frame divisor for the
+current format:
+
+```cpp
+// Returns the per-frame byte count that matches sendAudio()'s return value:
+// - conversion paths (pack24bit, push16To32, push16To24): input bytes per frame
+// - direct path: sink bytes per frame
+// Used by sendChunk() to correctly convert sendAudio()'s return to accepted frames.
+int getConsumedBytesPerFrame() const {
+    int channels = m_channels.load(std::memory_order_acquire);
+    if (m_need24BitPack.load(std::memory_order_acquire) ||
+        m_need16To32Upsample.load(std::memory_order_acquire) ||
+        m_need16To24Upsample.load(std::memory_order_acquire)) {
+        return m_inputBytesPerSample.load(std::memory_order_acquire) * channels;
+    }
+    return m_bytesPerSample.load(std::memory_order_acquire) * channels;
+}
+```
+
+`sendChunk()` in `src/main.cpp` replaces `acceptedFramesFromConsumedPcmBytes(consumedBytes,
+detectedChannels)` with:
+
+```cpp
+int cbpf = direttaPtr->getConsumedBytesPerFrame();
+size_t acceptedFrames = (cbpf > 0) ? consumedBytes / static_cast<size_t>(cbpf) : 0;
+```
+
+Verified correct for all paths:
+- direct 32-bit (direttaBps=4, inputBps=4): `written = frames × ch × 4`, ÷ `ch × 4` = `frames` ✓
+- direct 16-bit (direttaBps=2, inputBps=4): `written = frames × ch × 2`, ÷ `ch × 2` = `frames` ✓
+- pack24bit (direttaBps=3, inputBps=4): `written = samplesWritten × 4 = frames × ch × 4`, ÷ `ch × 4` = `frames` ✓
 
 ### `diretta/DirettaSync.cpp` — real-pop site in `getNewStream()`
 
@@ -334,6 +368,6 @@ added.
 
 | File | Change |
 |---|---|
-| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()` |
+| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()`, `getConsumedBytesPerFrame()` |
 | `diretta/DirettaSync.cpp` | increment `m_poppedFramesTotal` (frames, not bytes) before `m_popEpoch` at real-pop site |
-| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; consistent snapshot retry at init; split recovery by `draining` flag |
+| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; fix `sendChunk()` to use `getConsumedBytesPerFrame()`; consistent snapshot retry at init |
