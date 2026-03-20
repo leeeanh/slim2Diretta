@@ -31,13 +31,20 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     bool isRebuffering() const {
         return m_rebuffering.load(std::memory_order_acquire);
     }
+
+    // Returns channels * bytesPerSample for the negotiated sink format.
+    // Used by sendChunk() to convert sendAudio() byte return to frames without
+    // hardcoding sizeof(int32_t), so 16-bit and 24-bit Diretta sinks are correct.
+    int getSinkBytesPerFrame() const {
+        return m_bytesPerFrame.load(std::memory_order_acquire);
+    }
 ```
 
 The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
 
 `m_poppedFramesTotal` uses `alignas(64)` to give it its own cache line, matching `m_popEpoch` at line 525. `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getBytesPerBuffer()` is not needed: frame credits are used directly in the sender, with no byte-to-frame conversion in the hot path.
+`getSinkBytesPerFrame()` exposes the existing `m_bytesPerFrame` atomic (already at DirettaSync.h line 656), used to fix `sendChunk()` in Task 3.
 
 **Step 2: Verify it compiles**
 
@@ -163,7 +170,47 @@ Replace with:
 
 Both initialized from live consumer values immediately after `direttaPtr->open(audioFmt)` succeeds (line 1314). `firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()` which covers both the initial startup window and the post-resume re-prefill.
 
-**Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
+**Step 3: Fix `sendChunk()` to use the negotiated sink frame size**
+
+The lambda at line 1329 currently reads:
+
+```cpp
+                        auto sendChunk = [&](size_t frames) -> size_t {
+                            size_t consumedBytes = direttaPtr->sendAudio(
+                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
+                            size_t acceptedFrames = acceptedFramesFromConsumedPcmBytes(
+                                consumedBytes, detectedChannels);
+                            if (acceptedFrames > 0) {
+                                cachePopFrames(acceptedFrames);
+                                pushedFrames += acceptedFrames;
+                            }
+                            return acceptedFrames;
+                        };
+```
+
+`acceptedFramesFromConsumedPcmBytes()` divides by `channels * sizeof(int32_t)`. On 16-bit or 24-bit Diretta sinks `sendAudio()` returns fewer bytes per frame than 4, so `acceptedFrames` is undercounted — the decode-cache read pointer and `seenPoppedFramesTotal` both fall behind, causing the same replay drift the credit controller is meant to eliminate.
+
+Replace with:
+
+```cpp
+                        auto sendChunk = [&](size_t frames) -> size_t {
+                            size_t consumedBytes = direttaPtr->sendAudio(
+                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
+                            int sinkBpf = direttaPtr->getSinkBytesPerFrame();
+                            size_t acceptedFrames = (sinkBpf > 0)
+                                ? consumedBytes / static_cast<size_t>(sinkBpf)
+                                : 0;
+                            if (acceptedFrames > 0) {
+                                cachePopFrames(acceptedFrames);
+                                pushedFrames += acceptedFrames;
+                            }
+                            return acceptedFrames;
+                        };
+```
+
+`getSinkBytesPerFrame()` returns `m_bytesPerFrame` (channels × bytesPerSample for the negotiated sink format), added in Task 1. This makes `sendChunk()` format-independent without touching call sites.
+
+**Step 4: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
 ```bash
 make -j$(nproc) 2>&1 | grep "error:"
@@ -240,14 +287,20 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                                 bool draining = producerDone.load(std::memory_order_acquire);
 
                                 if (!draining) {
-                                    // Rebuffering only: gate on threshold BEFORE sending.
-                                    // When isRebuffering() is true, DirettaSync exits rebuffering
-                                    // once avail crosses REBUFFER_THRESHOLD_PCT, so stop there.
-                                    // Do NOT apply this gate for !isPrefillComplete() (startup /
-                                    // post-resume): FLAC prefill target is 40% of the ring (200ms
-                                    // of a 500ms buffer). Stopping at 20% here would prevent the
-                                    // ring from ever reaching m_prefillTarget, deadlocking startup.
+                                    // Gate on threshold only during genuine steady-state rebuffering
+                                    // (isRebuffering() true AND isPrefillComplete() true). Two cases
+                                    // where this gate must NOT fire:
+                                    //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill
+                                    //      target is ~40% of ring; stopping at 20% deadlocks startup.
+                                    //   2. Pause-during-rebuffer: resumePlayback() resets
+                                    //      m_prefillComplete but does NOT clear m_rebuffering, so
+                                    //      isRebuffering() can still be true post-resume. Without
+                                    //      isPrefillComplete() in the guard, post-resume recovery
+                                    //      stops at 20% and getNewStream() keeps returning silence
+                                    //      until m_prefillTarget (potentially 40%) is reached —
+                                    //      permanently stalling playback.
                                     if (direttaPtr->isRebuffering() &&
+                                            direttaPtr->isPrefillComplete() &&
                                             direttaPtr->getBufferLevel() >=
                                             DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
                                         continue;

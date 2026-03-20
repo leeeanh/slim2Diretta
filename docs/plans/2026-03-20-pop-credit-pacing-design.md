@@ -66,9 +66,21 @@ uint64_t getPoppedFramesTotal() const {
 bool isRebuffering() const {
     return m_rebuffering.load(std::memory_order_acquire);
 }
+
+// Returns channels * bytesPerSample for the negotiated sink format.
+// Exposes the existing m_bytesPerFrame atomic so sendChunk() can convert
+// sendAudio() byte return to frames without hardcoding sizeof(int32_t).
+// Necessary for correct operation on 16-bit and 24-bit Diretta sinks.
+int getSinkBytesPerFrame() const {
+    return m_bytesPerFrame.load(std::memory_order_acquire);
+}
 ```
 
 `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
+
+`getSinkBytesPerFrame()` exposes the existing `m_bytesPerFrame` (already declared at
+DirettaSync.h line 656). `sendChunk()` uses it to replace the `acceptedFramesFromConsumedPcmBytes()`
+call that hardcodes `sizeof(int32_t)`, making frame-to-byte accounting correct for all sink depths.
 
 `getBytesPerBuffer()` and `getFramesPerBuffer()` are not needed: the sender uses frame credits
 directly and does not re-derive the SDK frame quantum.
@@ -206,14 +218,22 @@ constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
     bool draining = producerDone.load(std::memory_order_acquire);
 
     if (!draining) {
-        // Rebuffering only: gate on threshold before injecting.
-        // When isRebuffering() is true, DirettaSync exits rebuffering once avail crosses
-        // REBUFFER_THRESHOLD_PCT, so the sender must not overshoot that point.
-        // When !isPrefillComplete() is true (startup/post-resume), do NOT apply this gate:
-        // getNewStream() keeps returning silence until avail >= m_prefillTarget, which can
-        // be well above 20% (e.g. FLAC prefill is 40% of a 500ms ring). Stopping at 20%
-        // here would deadlock startup by preventing the ring from ever reaching m_prefillTarget.
+        // Gate on threshold only during genuine steady-state rebuffering. The guard requires
+        // BOTH isRebuffering() AND isPrefillComplete() because:
+        //
+        //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill target can be 40%
+        //      of the ring (200ms of 500ms). Stopping at REBUFFER_THRESHOLD_PCT (20%) here
+        //      deadlocks startup by preventing the ring from reaching m_prefillTarget.
+        //
+        //   2. Pause-during-rebuffer: resumePlayback() resets m_prefillComplete = false but
+        //      does NOT clear m_rebuffering. Without isPrefillComplete() in the guard, the
+        //      first post-resume recovery stops at 20%, and getNewStream() keeps returning
+        //      silence until m_prefillTarget is reached — permanently stalling playback.
+        //
+        // When both flags are true the sender is in steady-state with a genuine underrun;
+        // DirettaSync will exit rebuffering once avail crosses the threshold, so stop there.
         if (direttaPtr->isRebuffering() &&
+            direttaPtr->isPrefillComplete() &&
             direttaPtr->getBufferLevel() >= DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
             continue;
         }
@@ -307,6 +327,6 @@ added.
 
 | File | Change |
 |---|---|
-| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()` |
+| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()`, `getSinkBytesPerFrame()` |
 | `diretta/DirettaSync.cpp` | increment `m_poppedFramesTotal` (frames, not bytes) before `m_popEpoch` at real-pop site |
-| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; split recovery by `draining` flag |
+| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; fix `sendChunk()` to use `getSinkBytesPerFrame()`; split recovery by `draining` flag |
