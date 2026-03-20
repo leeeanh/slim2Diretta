@@ -223,46 +223,43 @@ constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
            direttaPtr->isRebuffering() ||
            producerDone.load(std::memory_order_acquire)) {
 
-    bool draining = producerDone.load(std::memory_order_acquire);
+    // Gate on threshold only during genuine steady-state rebuffering. The guard requires
+    // BOTH isRebuffering() AND isPrefillComplete() AND NOT producerDone because:
+    //
+    //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill target can be 40%
+    //      of the ring (200ms of 500ms). Stopping at REBUFFER_THRESHOLD_PCT (20%) here
+    //      deadlocks startup by preventing the ring from reaching m_prefillTarget.
+    //
+    //   2. Pause-during-rebuffer: resumePlayback() resets m_prefillComplete = false but
+    //      does NOT clear m_rebuffering. Without isPrefillComplete() in the guard, the
+    //      first post-resume recovery stops at 20%, and getNewStream() keeps returning
+    //      silence until m_prefillTarget is reached — permanently stalling playback.
+    //
+    //   3. Producer-done drain: once decoding is finished, credits have stopped and the
+    //      cache must drain into the ring so natural-end detection can fire. Stopping at
+    //      the rebuffer threshold here would stall the drain permanently.
+    //
+    // When the first two conditions are true the sender is in steady-state with a genuine
+    // underrun; DirettaSync will exit rebuffering once avail crosses the threshold.
+    if (!producerDone.load(std::memory_order_acquire) &&
+        direttaPtr->isRebuffering() &&
+        direttaPtr->isPrefillComplete() &&
+        direttaPtr->getBufferLevel() >= DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
+        continue;
+    }
 
-    if (!draining) {
-        // Gate on threshold only during genuine steady-state rebuffering. The guard requires
-        // BOTH isRebuffering() AND isPrefillComplete() because:
-        //
-        //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill target can be 40%
-        //      of the ring (200ms of 500ms). Stopping at REBUFFER_THRESHOLD_PCT (20%) here
-        //      deadlocks startup by preventing the ring from reaching m_prefillTarget.
-        //
-        //   2. Pause-during-rebuffer: resumePlayback() resets m_prefillComplete = false but
-        //      does NOT clear m_rebuffering. Without isPrefillComplete() in the guard, the
-        //      first post-resume recovery stops at 20%, and getNewStream() keeps returning
-        //      silence until m_prefillTarget is reached — permanently stalling playback.
-        //
-        // When both flags are true the sender is in steady-state with a genuine underrun;
-        // DirettaSync will exit rebuffering once avail crosses the threshold, so stop there.
-        if (direttaPtr->isRebuffering() &&
-            direttaPtr->isPrefillComplete() &&
-            direttaPtr->getBufferLevel() >= DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
-            continue;
-        }
+    // Cap each recovery send to bound per-iteration ring fill — applied uniformly to
+    // startup, rebuffering, AND producer-done drain. An uncapped EOF drain can
+    // bulk-fill the ring in one 2ms wakeup if the cache holds a sizeable tail,
+    // delaying natural-end detection and gapless handoff by up to a full ring duration.
+    // With the cap the drain completes across several wakeups at consumer pace.
+    size_t recoveryCapFrames = (rate > 0)
+        ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
+        : RECOVERY_SEND_MIN_FRAMES;
 
-        // Cap each recovery send to bound per-iteration ring fill.
-        // Without a cap, one wakeup could fill the ring from near-empty to capacity.
-        size_t recoveryCapFrames = (rate > 0)
-            ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
-            : RECOVERY_SEND_MIN_FRAMES;
-
-        size_t contiguous = cacheContiguousFrames();
-        if (contiguous > 0) {
-            sendChunk(std::min(contiguous, recoveryCapFrames));
-        }
-    } else {
-        // Producer done: drain remaining decoded cache into ring without ceiling.
-        // Natural-end detection fires once bufferedBytes reaches zero.
-        size_t contiguous = cacheContiguousFrames();
-        if (contiguous > 0) {
-            sendChunk(contiguous);
-        }
+    size_t contiguous = cacheContiguousFrames();
+    if (contiguous > 0) {
+        sendChunk(std::min(contiguous, recoveryCapFrames));
     }
 
     // Exit recovery immediately on first resumed real pop (event-driven transition).
@@ -280,8 +277,10 @@ Recovery semantics:
 - **Rebuffering**: `DirettaSync` intentionally withholds real pops during rebuffering.
   Recovery injects bounded chunks until `getBufferLevel() >= REBUFFER_THRESHOLD_PCT`, at which
   point `DirettaSync` exits rebuffering and real pops resume.
-- **Producer-done drain**: flush remaining decoded cache into the ring; natural-end detection
-  fires as before once the ring is empty or stuck.
+- **Producer-done drain**: flush remaining decoded cache into the ring in bounded chunks
+  (same `RECOVERY_SEND_MAX_MS` cap as other recovery paths). Natural-end detection fires once
+  the ring is empty or stuck. An uncapped drain would bulk-fill the ring in one wakeup and
+  delay gapless handoff by up to a full ring's latency.
 
 The recovery-to-credit transition is event-driven: the first nonzero `poppedFramesDelta` after
 a drought immediately returns control to the credit path. No explicit mode-switch signal is

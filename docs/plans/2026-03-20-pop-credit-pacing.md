@@ -259,44 +259,43 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                                 // resumePlayback() clears the ring and resets m_prefillComplete,
                                 // so the sender correctly re-enters recovery after every unpause.
 
-                                bool draining = producerDone.load(std::memory_order_acquire);
+                                // Gate on threshold only during genuine steady-state rebuffering
+                                // (isRebuffering() true AND isPrefillComplete() true). Two cases
+                                // where this gate must NOT fire:
+                                //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill
+                                //      target is ~40% of ring; stopping at 20% deadlocks startup.
+                                //   2. Pause-during-rebuffer: resumePlayback() resets
+                                //      m_prefillComplete but does NOT clear m_rebuffering, so
+                                //      isRebuffering() can still be true post-resume. Without
+                                //      isPrefillComplete() in the guard, post-resume recovery
+                                //      stops at 20% and getNewStream() keeps returning silence
+                                //      until m_prefillTarget (potentially 40%) is reached —
+                                //      permanently stalling playback.
+                                // The threshold gate does NOT apply to the producer-done drain
+                                // case — when draining, credits have already stopped and the ring
+                                // must be filled to let natural-end detection fire.
+                                if (!producerDone.load(std::memory_order_acquire) &&
+                                        direttaPtr->isRebuffering() &&
+                                        direttaPtr->isPrefillComplete() &&
+                                        direttaPtr->getBufferLevel() >=
+                                        DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
+                                    continue;
+                                }
 
-                                if (!draining) {
-                                    // Gate on threshold only during genuine steady-state rebuffering
-                                    // (isRebuffering() true AND isPrefillComplete() true). Two cases
-                                    // where this gate must NOT fire:
-                                    //   1. Startup / post-resume (!isPrefillComplete()): FLAC prefill
-                                    //      target is ~40% of ring; stopping at 20% deadlocks startup.
-                                    //   2. Pause-during-rebuffer: resumePlayback() resets
-                                    //      m_prefillComplete but does NOT clear m_rebuffering, so
-                                    //      isRebuffering() can still be true post-resume. Without
-                                    //      isPrefillComplete() in the guard, post-resume recovery
-                                    //      stops at 20% and getNewStream() keeps returning silence
-                                    //      until m_prefillTarget (potentially 40%) is reached —
-                                    //      permanently stalling playback.
-                                    if (direttaPtr->isRebuffering() &&
-                                            direttaPtr->isPrefillComplete() &&
-                                            direttaPtr->getBufferLevel() >=
-                                            DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
-                                        continue;
-                                    }
+                                // Cap per-iteration send to bound ring fill per wakeup.
+                                // Applied uniformly to startup, rebuffering, AND producer-done drain.
+                                // The uncapped drain of the original design could bulk-fill the ring
+                                // in one 2ms wakeup when producerDone fires with a sizeable cache
+                                // tail, delaying natural-end detection and gapless handoff by up to
+                                // a full ring duration. With the cap, the drain completes across
+                                // several wakeups at consumer pace — no end-of-track latency added.
+                                size_t recoveryCapFrames = (rate > 0)
+                                    ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
+                                    : RECOVERY_SEND_MIN_FRAMES;
 
-                                    // Cap per-iteration send to bound ring fill per wakeup.
-                                    size_t recoveryCapFrames = (rate > 0)
-                                        ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
-                                        : RECOVERY_SEND_MIN_FRAMES;
-
-                                    size_t contiguous = cacheContiguousFrames();
-                                    if (contiguous > 0) {
-                                        sendChunk(std::min(contiguous, recoveryCapFrames));
-                                    }
-                                } else {
-                                    // Producer done: drain remaining decoded cache without ceiling.
-                                    // Natural-end detection fires once bufferedBytes reaches zero.
-                                    size_t contiguous = cacheContiguousFrames();
-                                    if (contiguous > 0) {
-                                        sendChunk(contiguous);
-                                    }
+                                size_t contiguous = cacheContiguousFrames();
+                                if (contiguous > 0) {
+                                    sendChunk(std::min(contiguous, recoveryCapFrames));
                                 }
 
                                 // Exit recovery immediately on first resumed real pop.
