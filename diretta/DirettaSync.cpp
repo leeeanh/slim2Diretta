@@ -843,7 +843,10 @@ bool DirettaSync::open(const AudioFormat& format) {
         effectiveSampleRate = format.sampleRate;
 
         int acceptedBits;
-        configureSinkPCM(format.sampleRate, format.channels, format.bitDepth, acceptedBits);
+        if (!configureSinkPCM(format.sampleRate, format.channels, format.bitDepth, acceptedBits)) {
+            DIRETTA_LOG("open() failed: no supported PCM format on this sink");
+            return false;
+        }
         bitsPerSample = acceptedBits;
 
         int direttaBps = (acceptedBits == 32) ? 4 : (acceptedBits == 24) ? 3 : 2;
@@ -853,6 +856,7 @@ bool DirettaSync::open(const AudioFormat& format) {
     }
 
     unsigned int cycleTimeUs = calculateCycleTime(effectiveSampleRate, effectiveChannels, bitsPerSample);
+    m_activeCycleTimeUs = cycleTimeUs;
     ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(cycleTimeUs);
 
     // Initial delay - Target needs time to prepare for new format
@@ -1109,7 +1113,7 @@ void DirettaSync::fullReset() {
 // Sink Configuration
 //=============================================================================
 
-void DirettaSync::configureSinkPCM(int rate, int channels, int inputBits, int& acceptedBits) {
+bool DirettaSync::configureSinkPCM(int rate, int channels, int inputBits, int& acceptedBits) {
     (void)inputBits;
     std::lock_guard<std::mutex> lock(m_configMutex);
 
@@ -1122,7 +1126,7 @@ void DirettaSync::configureSinkPCM(int rate, int channels, int inputBits, int& a
         setSinkConfigure(fmt);
         acceptedBits = 32;
         DIRETTA_LOG("Sink PCM: " << rate << "Hz " << channels << "ch 32-bit");
-        return;
+        return true;
     }
 
     fmt.setFormat(DIRETTA::FormatID::FMT_PCM_SIGNED_24);
@@ -1130,18 +1134,11 @@ void DirettaSync::configureSinkPCM(int rate, int channels, int inputBits, int& a
         setSinkConfigure(fmt);
         acceptedBits = 24;
         DIRETTA_LOG("Sink PCM: " << rate << "Hz " << channels << "ch 24-bit");
-        return;
+        return true;
     }
 
-    fmt.setFormat(DIRETTA::FormatID::FMT_PCM_SIGNED_16);
-    if (checkSinkSupport(fmt)) {
-        setSinkConfigure(fmt);
-        acceptedBits = 16;
-        DIRETTA_LOG("Sink PCM: " << rate << "Hz " << channels << "ch 16-bit");
-        return;
-    }
-
-    throw std::runtime_error("No supported PCM format found");
+    DIRETTA_LOG("Sink PCM: no supported format (32-bit and 24-bit both rejected)");
+    return false;
 }
 
 void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const AudioFormat& format) {
@@ -1836,8 +1833,12 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
     // Pop from ring buffer
     m_ringBuffer.pop(dest, currentBytesPerBuffer);
 
-    // Epoch incremented unconditionally before try_lock — allows sender to
-    // detect pops even when it holds the mutex (avoiding lost wakeups)
+    if (m_cachedBytesPerFrame > 0) {
+        m_poppedFramesTotal.fetch_add(
+            static_cast<uint64_t>(currentBytesPerBuffer) /
+            static_cast<uint64_t>(m_cachedBytesPerFrame),
+            std::memory_order_relaxed);
+    }
     m_popEpoch.fetch_add(1, std::memory_order_release);
 
 #ifdef HAVE_EVL

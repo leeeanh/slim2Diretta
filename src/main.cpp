@@ -1239,19 +1239,8 @@ int main(int argc, char* argv[]) {
                         LOG_DEBUG("[Producer] Done. totalBytes=" << totalBytes);
                     });
 
-                    enum class SenderMode { kRecovery, kSteady };
-                    constexpr float  STEADY_ENTER              = 0.75f;
-                    constexpr float  STEADY_EXIT               = 0.40f;
-                    constexpr float  STEADY_CEILING            = 0.65f;
-                    constexpr float  STEADY_CHUNK_MS           = 2.0f;
-                    constexpr size_t STEADY_CHUNK_MIN_FRAMES   = 128;
-                    constexpr size_t STEADY_CHUNK_MAX_FRAMES   = 512;
-                    constexpr float  DEEP_RECOVERY_THRESHOLD   = 0.20f;
-                    constexpr float  RECOVERY_CHUNK_MS         = 5.0f;
-                    constexpr float  DEEP_RECOVERY_CHUNK_MS    = 10.0f;
-                    constexpr size_t RECOVERY_CHUNK_MIN_FRAMES = 128;
-                    constexpr size_t RECOVERY_CHUNK_MAX_FRAMES = 1024;
-                    SenderMode senderMode = SenderMode::kRecovery;
+                    constexpr float  RECOVERY_SEND_MAX_MS     = 10.0f;
+                    constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
 
                     std::thread senderThread([&]() {
                         setRealtimePriority(g_rtPriority);
@@ -1324,7 +1313,14 @@ int main(int argc, char* argv[]) {
                         bool direttaOpened = true;
                         slimproto->sendStat(StatEvent::STMl);
 
-                        uint64_t seenEpoch = direttaPtr->getPopEpoch();
+                        uint64_t seenEpoch, seenPoppedFramesTotal;
+                        do {
+                            seenEpoch = direttaPtr->getPopEpoch();
+                            seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
+                        } while (direttaPtr->getPopEpoch() != seenEpoch);
+                        unsigned int eofDroughtCount = 0;
+                        unsigned int eofDroughtWakeups =
+                            std::max(6u, direttaPtr->getActiveCycleTimeUs() * 2u / 2000u);
 
                         auto sendChunk = [&](size_t frames) -> size_t {
                             size_t consumedBytes = direttaPtr->sendAudio(
@@ -1422,53 +1418,62 @@ int main(int argc, char* argv[]) {
 #ifdef HAVE_EVL
                             }
 #endif
-                            seenEpoch = direttaPtr->getPopEpoch();
+                            uint64_t currentEpoch = direttaPtr->getPopEpoch();
+                            uint64_t currentFramesTotal = direttaPtr->getPoppedFramesTotal();
+                            seenEpoch = currentEpoch;
 
                             if (direttaPtr->isPaused()) {
+                                seenPoppedFramesTotal = currentFramesTotal;
                                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                                 continue;
                             }
 
-                            // State transition once per wakeup with hysteresis to prevent mode flap.
-                            float level = direttaPtr->getBufferLevel();
-                            if (senderMode == SenderMode::kRecovery && level >= STEADY_ENTER) {
-                                senderMode = SenderMode::kSteady;
-                            } else if (senderMode == SenderMode::kSteady && level < STEADY_EXIT) {
-                                senderMode = SenderMode::kRecovery;
-                            }
-
-                            if (senderMode == SenderMode::kRecovery) {
-                                // level was already sampled for the mode transition — reuse it.
-                                float chunkMs = (level < DEEP_RECOVERY_THRESHOLD)
-                                    ? DEEP_RECOVERY_CHUNK_MS : RECOVERY_CHUNK_MS;
-                                size_t chunkFrames = (rate > 0)
-                                    ? std::clamp(
-                                          static_cast<size_t>(rate * chunkMs / 1000.0f),
-                                          RECOVERY_CHUNK_MIN_FRAMES,
-                                          RECOVERY_CHUNK_MAX_FRAMES)
-                                    : RECOVERY_CHUNK_MIN_FRAMES;
-                                size_t contiguous = cacheContiguousFrames();
-                                if (contiguous > 0) {
-                                    sendChunk(std::min(contiguous, chunkFrames));
-                                }
-                            } else {
-                                size_t steadyChunkFrames = (rate > 0)
-                                    ? std::clamp(
-                                          static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
-                                          STEADY_CHUNK_MIN_FRAMES,
-                                          STEADY_CHUNK_MAX_FRAMES)
-                                    : STEADY_CHUNK_MIN_FRAMES;
-
-                                if (direttaPtr->getBufferLevel() < STEADY_CEILING) {
-                                    size_t contiguous = cacheContiguousFrames();
-                                    if (contiguous > 0) {
-                                        sendChunk(std::min(contiguous, steadyChunkFrames));
-                                    }
-                                }
-                            }
-
                             if (audioFmtReady.load(std::memory_order_relaxed)) {
                                 updateElapsed();
+                            }
+
+                            uint64_t poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal;
+
+                            if (poppedFramesDelta > 0) {
+                                eofDroughtCount = 0;
+                                size_t targetCacheFrames = static_cast<size_t>(poppedFramesDelta);
+                                size_t contiguous = cacheContiguousFrames();
+                                size_t framesToSend = std::min(targetCacheFrames, contiguous);
+                                size_t actualSent = 0;
+                                if (framesToSend > 0) {
+                                    actualSent = sendChunk(framesToSend);
+                                }
+                                seenPoppedFramesTotal += actualSent;
+                                continue;
+                            } else {
+                                if (producerDone.load(std::memory_order_acquire)) {
+                                    ++eofDroughtCount;
+                                }
+                                if (!direttaPtr->isPrefillComplete() ||
+                                    direttaPtr->isRebuffering() ||
+                                    (producerDone.load(std::memory_order_acquire) &&
+                                     eofDroughtCount >= eofDroughtWakeups)) {
+                                    if (!producerDone.load(std::memory_order_acquire) &&
+                                        direttaPtr->isRebuffering() &&
+                                        direttaPtr->isPrefillComplete() &&
+                                        direttaPtr->getBufferLevel() >=
+                                            DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
+                                        continue;
+                                    }
+
+                                    size_t recoveryCapFrames = (rate > 0)
+                                        ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
+                                        : RECOVERY_SEND_MIN_FRAMES;
+
+                                    size_t contiguous = cacheContiguousFrames();
+                                    if (contiguous > 0) {
+                                        sendChunk(std::min(contiguous, recoveryCapFrames));
+                                    }
+
+                                    if (direttaPtr->getPopEpoch() != seenEpoch) {
+                                        continue;
+                                    }
+                                }
                             }
                         }
 

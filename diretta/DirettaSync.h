@@ -528,6 +528,21 @@ public:
         return m_popEpoch.load(std::memory_order_acquire);
     }
 
+    alignas(64) std::atomic<uint64_t> m_poppedFramesTotal{0};
+
+    uint64_t getPoppedFramesTotal() const {
+        return m_poppedFramesTotal.load(std::memory_order_acquire);
+    }
+
+    bool isRebuffering() const {
+        return m_rebuffering.load(std::memory_order_acquire);
+    }
+
+    // Returns the cycle time (us) negotiated by the most recent open().
+    // open() runs on the sender thread; eofDroughtWakeups is derived
+    // immediately after open() returns on that same thread.
+    unsigned int getActiveCycleTimeUs() const { return m_activeCycleTimeUs; }
+
     //=========================================================================
     // Target Management
     //=========================================================================
@@ -559,7 +574,7 @@ private:
     void fullReset();
     void shutdownWorker();
 
-    void configureSinkPCM(int rate, int channels, int inputBits, int& acceptedBits);
+    bool configureSinkPCM(int rate, int channels, int inputBits, int& acceptedBits);
     void configureSinkDSD(uint32_t dsdBitRate, int channels, const AudioFormat& format);
     void configureRingPCM(int rate, int channels, int direttaBps, int inputBps, bool isCompressed);
     void configureRingDSD(uint32_t byteRate, int channels);
@@ -593,6 +608,7 @@ private:
 
     DirettaConfig m_config;
     std::unique_ptr<DirettaCycleCalculator> m_calculator;
+    unsigned int m_activeCycleTimeUs = 10000;
 
     // Target
     ACQUA::IPAddress m_targetAddress;

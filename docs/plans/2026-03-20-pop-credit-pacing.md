@@ -31,6 +31,11 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     bool isRebuffering() const {
         return m_rebuffering.load(std::memory_order_acquire);
     }
+
+    // Returns the cycle time (µs) negotiated by the most recent open().
+    // open() runs on the sender thread; eofDroughtWakeups is computed from
+    // this immediately after open() returns — same-thread, no sync needed.
+    unsigned int getActiveCycleTimeUs() const { return m_activeCycleTimeUs; }
 ```
 
 The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
@@ -42,10 +47,31 @@ The insertion point is the blank line after `getPopEpoch()` at line 529, before 
 reachable paths (32-bit direct and pack24bit), so `acceptedFramesFromConsumedPcmBytes()` is
 already correct — no change to `sendChunk()` is required.
 
+**Step 1b: Add `m_activeCycleTimeUs` member and store it in `open()`**
+
+In `diretta/DirettaSync.h`, in the private data section near `m_config` and `m_calculator`
+(around line 594), insert:
+
+```cpp
+    unsigned int m_activeCycleTimeUs = 10000;   // cycle period last set by open(); 10 ms default
+```
+
+In `diretta/DirettaSync.cpp`, immediately after the `calculateCycleTime()` call inside
+`open()` (line 855), add the store:
+
+```cpp
+    unsigned int cycleTimeUs = calculateCycleTime(effectiveSampleRate, effectiveChannels, bitsPerSample);
+    m_activeCycleTimeUs = cycleTimeUs;   // publish for sender's eofDroughtWakeups derivation
+    ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(cycleTimeUs);
+```
+
+The write and read both happen on the sender thread (open() is called from the sender, and
+eofDroughtWakeups is computed right after it returns), so no atomic or fence is needed.
+
 **Step 2: Verify it compiles**
 
 ```bash
-cd /path/to/slim2Diretta/build && make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+cd /path/to/slim2Diretta/build && make -j$(getconf _NPROCESSORS_ONLN) > /tmp/slim2d_build.log 2>&1 \
     && echo "Build OK" \
     || { tail -20 /tmp/slim2d_build.log; echo "Build FAILED"; exit 1; }
 ```
@@ -55,8 +81,8 @@ Expected: "Build OK", no new warnings in the log.
 **Step 3: Commit**
 
 ```bash
-git add diretta/DirettaSync.h
-git commit -m "feat(diretta): add m_poppedFramesTotal and isRebuffering accessors"
+git add diretta/DirettaSync.h diretta/DirettaSync.cpp
+git commit -m "feat(diretta): add m_poppedFramesTotal, isRebuffering, getActiveCycleTimeUs accessors"
 ```
 
 ---
@@ -125,7 +151,7 @@ correct output through this path.
 **Step 3: Verify it compiles**
 
 ```bash
-make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+make -j$(getconf _NPROCESSORS_ONLN) > /tmp/slim2d_build.log 2>&1 \
     && echo "Build OK" \
     || { tail -20 /tmp/slim2d_build.log; echo "Build FAILED"; exit 1; }
 ```
@@ -190,6 +216,9 @@ Replace with:
                             seenEpoch             = direttaPtr->getPopEpoch();
                             seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
                         } while (direttaPtr->getPopEpoch() != seenEpoch);
+                        unsigned int eofDroughtCount   = 0;
+                        unsigned int eofDroughtWakeups =
+                            std::max(6u, direttaPtr->getActiveCycleTimeUs() * 2u / 2000u);
 ```
 
 `open()` calls `play()` before returning, so pops can race the two loads. If a pop lands
@@ -205,7 +234,7 @@ which covers both the initial startup window and the post-resume re-prefill.
 **Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
 ```bash
-make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+make -j$(getconf _NPROCESSORS_ONLN) > /tmp/slim2d_build.log 2>&1 \
     && echo "Build OK" \
     || { grep "error:" /tmp/slim2d_build.log | head -20; echo "Build FAILED"; exit 1; }
 ```
@@ -253,6 +282,7 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                             if (poppedFramesDelta > 0) {
                                 // Credit path: frame credits are format-independent.
                                 // No byte-to-frame conversion needed.
+                                eofDroughtCount = 0;   // pops still arriving; reset drought counter.
                                 size_t targetCacheFrames = static_cast<size_t>(poppedFramesDelta);
 
                                 size_t contiguous   = cacheContiguousFrames();
@@ -270,9 +300,13 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                                 seenPoppedFramesTotal += actualSent;
                                 continue;
 
-                            } else if (!direttaPtr->isPrefillComplete() ||
-                                       direttaPtr->isRebuffering() ||
-                                       producerDone.load(std::memory_order_acquire)) {
+                            } else {
+                                if (producerDone.load(std::memory_order_acquire))
+                                    ++eofDroughtCount;  // count consecutive no-pop wakeups at EOF
+                                if (!direttaPtr->isPrefillComplete() ||
+                                    direttaPtr->isRebuffering() ||
+                                    (producerDone.load(std::memory_order_acquire) &&
+                                     eofDroughtCount >= eofDroughtWakeups)) {
                                 // Fallback recovery: consumer is deliberately withholding pops.
                                 // !isPrefillComplete() covers both initial startup and post-resume:
                                 // resumePlayback() clears the ring and resets m_prefillComplete,
@@ -321,8 +355,9 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                                 if (direttaPtr->getPopEpoch() != seenEpoch) {
                                     continue;
                                 }
-                            }
-                            // else: no credits, not in an exceptional state — wait for next pop.
+                                }  // end recovery if
+                            }  // end else
+                            // No credits, not in an exceptional state — wait for next pop.
 ```
 
 **Step 2: Remove the now-duplicate `updateElapsed()` call at line 1471**
@@ -345,7 +380,7 @@ Delete those three lines (the `if (audioFmtReady...) { updateElapsed(); }` block
 **Step 3: Verify it compiles cleanly**
 
 ```bash
-make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+make -j$(getconf _NPROCESSORS_ONLN) > /tmp/slim2d_build.log 2>&1 \
     && echo "Build OK" \
     || { grep "error:" /tmp/slim2d_build.log | head -20; echo "Build FAILED"; exit 1; }
 ```
@@ -382,7 +417,7 @@ In the new design `seenEpoch` is advanced unconditionally at the top of each ite
 Verify by inspection that the predicate compiles and that `seenEpoch` still refers to the local declared in Task 3 Step 2:
 
 ```bash
-make -j$(nproc) 2>&1 | grep -i "seenEpoch\|error"
+make -j$(getconf _NPROCESSORS_ONLN) 2>&1 | grep -i "seenEpoch\|error"
 ```
 
 Expected: no errors.
@@ -429,9 +464,11 @@ Play a short track to completion. Confirm:
 - `STMd` and `STMu` stats are sent (visible as LMS track advance)
 - No hang at end of track
 
-**Criterion 6 — Non-32-bit sink: no ring drift**
+**Criterion 6 — 24-bit sink: no ring drift**
 
-If a 16-bit or 24-bit output target is available, play a 44.1 kHz track for several minutes. Confirm `direttaBytes` stays flat (same as Criterion 1). The frame credit unit is format-independent: this verifies no under-repayment on non-32-bit sinks.
+If a 24-bit output target is available, play a 44.1 kHz track for several minutes. Confirm `direttaBytes` stays flat (same as Criterion 1). The frame credit unit is format-independent: this verifies no under-repayment on non-32-bit sinks.
+
+> **Note — 16-bit sink compatibility drop**: Task 2 removes `FMT_PCM_SIGNED_16` negotiation from `configureSinkPCM()`. Any sink that advertises only 16-bit PCM will now receive `No supported PCM format found` from `open()` instead of the previously-silently-corrupt audio (the old path copied only the low two bytes of each int32_t without downconverting). This is an intentional correctness fix, not a regression. 16-bit-only targets are not a supported test configuration for this plan.
 
 **Step: Final commit if any runtime fixups were made**
 

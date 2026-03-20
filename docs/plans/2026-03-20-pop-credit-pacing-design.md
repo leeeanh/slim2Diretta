@@ -153,7 +153,15 @@ do {
     seenEpoch             = direttaPtr->getPopEpoch();
     seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
 } while (direttaPtr->getPopEpoch() != seenEpoch);
+
+unsigned int eofDroughtCount   = 0;
+unsigned int eofDroughtWakeups = std::max(6u, direttaPtr->getActiveCycleTimeUs() * 2u / 2000u);
 ```
+
+`eofDroughtCount` tracks consecutive zero-delta wakeups while `producerDone` is true. The
+EOF drain path is only activated once this counter reaches `eofDroughtWakeups` (see below),
+preventing burst refills during normal end-of-track playback when inter-pop gaps are wider
+than the sender's 2ms wakeup interval.
 
 `open()` calls `play()` before returning, so real pops can already be racing. If a pop lands
 between the two loads, `seenEpoch` holds epoch N while `seenPoppedFramesTotal` already includes
@@ -188,13 +196,38 @@ which correctly covers both the startup window and post-resume re-prefill (see b
                                                     // the credit path's early continue would
                                                     // otherwise skip it every steady-state wakeup.
 6. Compute poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal
-7. If poppedFramesDelta > 0: run credit path.
-8. Else if !direttaPtr()->isPrefillComplete()
-        || direttaPtr->isRebuffering()
-        || producerDone.load(std::memory_order_acquire):
-       run fallback recovery.
+7. If poppedFramesDelta > 0:
+       eofDroughtCount = 0                         // pops still arriving; reset drought counter
+       run credit path.
+8. Else:
+       if producerDone: ++eofDroughtCount           // count consecutive no-pop wakeups at EOF
+       if !direttaPtr->isPrefillComplete()
+            || direttaPtr->isRebuffering()
+            || (producerDone && eofDroughtCount >= eofDroughtWakeups):
+          run fallback recovery.
 9. Else: continue waiting.
 ```
+
+`eofDroughtWakeups` is derived after `open()` rather than fixed:
+
+```cpp
+eofDroughtWakeups = std::max(6u, direttaPtr->getActiveCycleTimeUs() * 2u / 2000u);
+```
+
+`getActiveCycleTimeUs()` returns the cycle time (µs) computed by `open()` at the
+`calculateCycleTime()` call site, stored in `m_activeCycleTimeUs` (plain `unsigned int`,
+no atomic — `open()` and the read both run on the sender thread). Multiplying by 2 and
+dividing by 2000 (2 ms/wakeup) gives a hold-off of 2 inter-pop periods. A floor of 6
+preserves the existing behaviour at standard MTUs. Examples:
+
+| Config | cycleTimeUs | eofDroughtWakeups | hold-off |
+|--------|-------------|-------------------|----------|
+| MTU 1500 / 44.1 kHz / 32-bit | ~4 000 µs | max(6, 4) = **6** | 12 ms |
+| MTU 9000 / 44.1 kHz / 32-bit | ~25 000 µs | max(6, 25) = **25** | 50 ms |
+| MTU 9000 / 44.1 kHz / 16-bit | 50 000 µs (cap) | max(6, 50) = **50** | 100 ms |
+
+On high-MTU targets the threshold scales to stay safely above the actual pop interval,
+preventing premature EOF recovery bursts between ordinary pops.
 
 **Note on `isPrefillComplete()` replacing `firstPopReceived`**: `resumePlayback()` clears the
 ring buffer and resets `m_prefillComplete = false` (DirettaSync.cpp line 1497). With
@@ -207,6 +240,8 @@ required.
 
 ```cpp
 if (poppedFramesDelta > 0) {
+    eofDroughtCount = 0;   // pops still arriving; any EOF drought resets
+
     size_t targetCacheFrames = static_cast<size_t>(poppedFramesDelta);
 
     size_t contiguous   = cacheContiguousFrames();
@@ -248,12 +283,19 @@ Recovery runs only when there are no new credits and one of the three exceptiona
 holds. It is no longer the primary pacing mode.
 
 ```cpp
-constexpr float  RECOVERY_SEND_MAX_MS    = 10.0f;
-constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
+constexpr float        RECOVERY_SEND_MAX_MS    = 10.0f;
+constexpr size_t       RECOVERY_SEND_MIN_FRAMES = 256;
+// eofDroughtWakeups is a local computed after open() — see Initialization section.
 
-} else if (!direttaPtr->isPrefillComplete() ||
-           direttaPtr->isRebuffering() ||
-           producerDone.load(std::memory_order_acquire)) {
+} else {
+    if (producerDone.load(std::memory_order_acquire)) {
+        ++eofDroughtCount;
+    }
+
+    if (!direttaPtr->isPrefillComplete() ||
+        direttaPtr->isRebuffering() ||
+        (producerDone.load(std::memory_order_acquire) &&
+         eofDroughtCount >= eofDroughtWakeups)) {
 
     // Gate on threshold only during genuine steady-state rebuffering. The guard requires
     // BOTH isRebuffering() AND isPrefillComplete() AND NOT producerDone because:
