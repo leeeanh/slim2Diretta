@@ -1384,6 +1384,10 @@ int main(int argc, char* argv[]) {
                             // After ~20ms of no change we declare natural end; the stuck bytes
                             // (<1 SDK buffer, <1ms of audio) have already been replaced by silence.
                             if (pDone && cFrames == 0) {
+                                // Signal DirettaSync that no more audio is coming so it can
+                                // play the last partial buffer with silence padding instead of
+                                // entering rebuffering mode (which would cause a click + silent tail).
+                                direttaPtr->setEndOfStream();
                                 if (dBytes == prevDBytes) {
                                     if (++dBytesUnchangedCount >= 10) {
                                         LOG_DEBUG("[Sender] Natural stream end declared"

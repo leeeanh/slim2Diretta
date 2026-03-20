@@ -538,6 +538,16 @@ public:
         return m_rebuffering.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief Signal that no more audio data will be pushed for this track.
+     * When set, getNewStream() plays the last partial buffer (padded with silence)
+     * instead of entering rebuffering mode — prevents click + silent tail at end-of-stream.
+     * Cleared automatically by clear() / open().
+     */
+    void setEndOfStream() {
+        m_endOfStream.store(true, std::memory_order_release);
+    }
+
     // Returns the cycle time (us) negotiated by the most recent open().
     // open() runs on the sender thread; eofDroughtWakeups is derived
     // immediately after open() returns on that same thread.
@@ -725,6 +735,7 @@ private:
     std::atomic<int> m_pushCount{0};
     std::atomic<uint32_t> m_underrunCount{0};
     std::atomic<bool> m_rebuffering{false};              // Rebuffering after sustained underrun
+    std::atomic<bool> m_endOfStream{false};              // Set by sender when no more audio is coming
 };
 
 #endif // DIRETTA_SYNC_H

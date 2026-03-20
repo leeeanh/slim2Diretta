@@ -920,6 +920,7 @@ bool DirettaSync::open(const AudioFormat& format) {
     }
 
     // Clear buffer and start playback
+    m_endOfStream.store(false, std::memory_order_release);
     m_ringBuffer.clear();
     m_prefillComplete = false;
     m_postOnlineDelayDone = false;
@@ -1488,6 +1489,7 @@ void DirettaSync::resumePlayback() {
     m_draining = false;
     m_stopRequested = false;
     m_silenceBuffersRemaining = 0;
+    m_endOfStream.store(false, std::memory_order_release);
 
     // Clear stale buffer data and require fresh prefill
     m_ringBuffer.clear();
@@ -1820,6 +1822,31 @@ bool DirettaSync::getNewStream(diretta_stream& baseStream) {
 
     // Underrun detection — enter rebuffering mode for clean silence
     if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
+        // End-of-stream: play the remaining bytes padded with silence instead of
+        // entering rebuffering mode.  This prevents a click + silent tail caused
+        // by the rebuffering threshold (20% of ring) never being reached when the
+        // producer is done and no more data is coming.
+        if (avail > 0 && m_endOfStream.load(std::memory_order_acquire)) {
+            m_ringBuffer.pop(dest, avail);
+            std::memset(dest + avail, currentSilenceByte, currentBytesPerBuffer - avail);
+            // Credit accounting for the frames actually consumed.
+            if (m_cachedBytesPerFrame > 0 && avail >= static_cast<size_t>(m_cachedBytesPerFrame)) {
+                m_poppedFramesTotal.fetch_add(
+                    static_cast<uint64_t>(avail) / static_cast<uint64_t>(m_cachedBytesPerFrame),
+                    std::memory_order_relaxed);
+            }
+            m_popEpoch.fetch_add(1, std::memory_order_release);
+            if (m_flowMutex.try_lock()) {
+                m_flowMutex.unlock();
+                m_spaceAvailable.notify_one();
+            }
+#ifdef HAVE_EVL
+            if (m_popSemReady) evl_put_sem(&m_popSem);
+#endif
+            m_workerActive = false;
+            return true;
+        }
+
         m_underrunCount.fetch_add(1, std::memory_order_relaxed);
         if (!m_rebuffering.load(std::memory_order_relaxed)) {
             m_rebuffering.store(true, std::memory_order_release);
