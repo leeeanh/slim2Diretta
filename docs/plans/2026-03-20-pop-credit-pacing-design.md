@@ -73,47 +73,45 @@ bool isRebuffering() const {
 `getBytesPerBuffer()` and `getFramesPerBuffer()` are not needed: the sender uses frame credits
 directly and does not re-derive the SDK frame quantum.
 
-`sendAudio()` has inconsistent return conventions across paths:
-- **Conversion paths** (`pack24bit`, `push16To32`, `push16To24`): return **input bytes consumed**
-  (`samplesWritten × inputBps × channels`).
-- **Direct path** (else branch): returns **sink bytes written** (`frames × direttaBps × channels`).
+`sendAudio()`'s return value convention is consistent for the two paths actually reachable
+when `audioFmt.bitDepth = 32`:
+- **`pack24bit`** (32-bit input → 24-bit sink): returns `samplesWritten × 4` = input bytes ✓
+- **Direct** (32-bit input → 32-bit sink, direttaBps=4=inputBps): returns `frames × ch × 4`
+  = input bytes ✓
 
-For 32-bit sinks (direttaBps = inputBps = 4), the two are the same. For 16-bit sinks
-(direttaBps = 2, inputBps = 4 — from `int inputBps = (bitDepth == 32) ? 4 : 2` at line 850
-of DirettaSync.cpp), the direct path returns `frames × channels × 2`, and
-`acceptedFramesFromConsumedPcmBytes()` dividing by `channels × 4` undercounts by 2x.
+Both cases divide correctly by `channels × sizeof(int32_t)`, so
+`acceptedFramesFromConsumedPcmBytes()` is **unchanged** and **no new accessor is needed**.
 
-Add a `getConsumedBytesPerFrame()` accessor to expose the correct per-frame divisor for the
-current format:
+`getConsumedBytesPerFrame()` is **not** added. The 16-bit direct path (direttaBps=2) would
+break this invariant — `sendAudio()` would return `frames × ch × 2` (half the input bytes)
+and `acceptedFramesFromConsumedPcmBytes()` would undercount by 2×. However, the 16-bit path
+also silently corrupts audio because `m_ringBuffer.push(data, frames × ch × 2)` copies only
+the low two bytes of each int32_t sample, producing garbage PCM rather than a proper 32→16
+downconversion. There is no `push32To16()` implementation. Adding one is outside the scope
+of this pacing design.
+
+### `diretta/DirettaSync.cpp` — remove 16-bit fallback in `configureSinkPCM()`
+
+`configureSinkPCM()` falls back to `FMT_PCM_SIGNED_16` if the sink rejects 32-bit and 24-bit.
+The 16-bit direct path in `sendAudio()` was never correct (audio corruption, frame accounting
+undercount). Remove the fallback so sinks that support neither 32-bit nor 24-bit get a clear
+runtime error rather than silent corruption:
 
 ```cpp
-// Returns the per-frame byte count that matches sendAudio()'s return value:
-// - conversion paths (pack24bit, push16To32, push16To24): input bytes per frame
-// - direct path: sink bytes per frame
-// Used by sendChunk() to correctly convert sendAudio()'s return to accepted frames.
-int getConsumedBytesPerFrame() const {
-    int channels = m_channels.load(std::memory_order_acquire);
-    if (m_need24BitPack.load(std::memory_order_acquire) ||
-        m_need16To32Upsample.load(std::memory_order_acquire) ||
-        m_need16To24Upsample.load(std::memory_order_acquire)) {
-        return m_inputBytesPerSample.load(std::memory_order_acquire) * channels;
-    }
-    return m_bytesPerSample.load(std::memory_order_acquire) * channels;
+// Delete these lines from configureSinkPCM():
+fmt.setFormat(DIRETTA::FormatID::FMT_PCM_SIGNED_16);
+if (checkSinkSupport(fmt)) {
+    setSinkConfigure(fmt);
+    acceptedBits = 16;
+    DIRETTA_LOG("Sink PCM: " << rate << "Hz " << channels << "ch 16-bit");
+    return;
 }
 ```
 
-`sendChunk()` in `src/main.cpp` replaces `acceptedFramesFromConsumedPcmBytes(consumedBytes,
-detectedChannels)` with:
-
-```cpp
-int cbpf = direttaPtr->getConsumedBytesPerFrame();
-size_t acceptedFrames = (cbpf > 0) ? consumedBytes / static_cast<size_t>(cbpf) : 0;
-```
-
-Verified correct for all paths:
-- direct 32-bit (direttaBps=4, inputBps=4): `written = frames × ch × 4`, ÷ `ch × 4` = `frames` ✓
-- direct 16-bit (direttaBps=2, inputBps=4): `written = frames × ch × 2`, ÷ `ch × 2` = `frames` ✓
-- pack24bit (direttaBps=3, inputBps=4): `written = samplesWritten × 4 = frames × ch × 4`, ÷ `ch × 4` = `frames` ✓
+After this removal, `configureSinkPCM()` throws `std::runtime_error("No supported PCM format
+found")` if neither 32-bit nor 24-bit is accepted — the same error it already throws for
+targets that reject all three formats. No 16-bit-only target was ever producing correct audio
+through this code path.
 
 ### `diretta/DirettaSync.cpp` — real-pop site in `getNewStream()`
 
@@ -368,6 +366,6 @@ added.
 
 | File | Change |
 |---|---|
-| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()`, `getConsumedBytesPerFrame()` |
-| `diretta/DirettaSync.cpp` | increment `m_poppedFramesTotal` (frames, not bytes) before `m_popEpoch` at real-pop site |
-| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; fix `sendChunk()` to use `getConsumedBytesPerFrame()`; consistent snapshot retry at init |
+| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()` |
+| `diretta/DirettaSync.cpp` | increment `m_poppedFramesTotal` before `m_popEpoch` at real-pop site; remove `FMT_PCM_SIGNED_16` fallback from `configureSinkPCM()` |
+| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; consistent snapshot retry at init |

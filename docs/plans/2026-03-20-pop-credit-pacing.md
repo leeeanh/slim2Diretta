@@ -31,31 +31,16 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     bool isRebuffering() const {
         return m_rebuffering.load(std::memory_order_acquire);
     }
-
-    // Returns the per-frame byte count that matches sendAudio()'s return value.
-    // sendAudio() is inconsistent: conversion paths (pack24bit, push16To32, push16To24)
-    // return input bytes consumed; the direct PCM copy path returns sink bytes written.
-    // On 16-bit sinks (direttaBps=2, inputBps=4), the direct path returns frames×ch×2,
-    // so acceptedFramesFromConsumedPcmBytes(÷4) would undercount by 2x.
-    // Using this accessor in sendChunk() gives the correct divisor for all cases.
-    int getConsumedBytesPerFrame() const {
-        int channels = m_channels.load(std::memory_order_acquire);
-        if (m_need24BitPack.load(std::memory_order_acquire) ||
-            m_need16To32Upsample.load(std::memory_order_acquire) ||
-            m_need16To24Upsample.load(std::memory_order_acquire)) {
-            return m_inputBytesPerSample.load(std::memory_order_acquire) * channels;
-        }
-        return m_bytesPerSample.load(std::memory_order_acquire) * channels;
-    }
 ```
 
 The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
 
 `m_poppedFramesTotal` uses `alignas(64)` to give it its own cache line, matching `m_popEpoch` at line 525. `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getConsumedBytesPerFrame()` reads existing atomics (`m_channels`, `m_need24BitPack`,
-`m_need16To32Upsample`, `m_need16To24Upsample`, `m_inputBytesPerSample`, `m_bytesPerSample`
-— all already declared in DirettaSync.h). No new state is added.
+`getConsumedBytesPerFrame()` is **not** added. After the 16-bit fallback is removed from
+`configureSinkPCM()` (Task 2, Step 2), `sendAudio()` consistently returns input bytes for all
+reachable paths (32-bit direct and pack24bit), so `acceptedFramesFromConsumedPcmBytes()` is
+already correct — no change to `sendChunk()` is required.
 
 **Step 2: Verify it compiles**
 
@@ -71,7 +56,7 @@ Expected: "Build OK", no new warnings in the log.
 
 ```bash
 git add diretta/DirettaSync.h
-git commit -m "feat(diretta): add m_poppedFramesTotal, isRebuffering, getConsumedBytesPerFrame"
+git commit -m "feat(diretta): add m_poppedFramesTotal and isRebuffering accessors"
 ```
 
 ---
@@ -116,19 +101,42 @@ Replace with:
 
 `m_poppedFramesTotal` is incremented here and **nowhere else**. It must not advance on silence, underrun, or rebuffering returns — all of which return before reaching this line.
 
-**Step 2: Verify it compiles**
+**Step 2: Remove the 16-bit fallback from `configureSinkPCM()`**
 
-```bash
-make -j$(nproc) 2>&1 | head -40
+In `diretta/DirettaSync.cpp`, inside `configureSinkPCM()` at lines 1136–1142, delete:
+
+```cpp
+    fmt.setFormat(DIRETTA::FormatID::FMT_PCM_SIGNED_16);
+    if (checkSinkSupport(fmt)) {
+        setSinkConfigure(fmt);
+        acceptedBits = 16;
+        DIRETTA_LOG("Sink PCM: " << rate << "Hz " << channels << "ch 16-bit");
+        return;
+    }
 ```
 
-Expected: clean build.
+The 16-bit direct path in `sendAudio()` calls `m_ringBuffer.push(data, frames × ch × 2)`,
+which copies only the low two bytes of each int32_t sample — not a 32→16 downconversion.
+No `push32To16()` exists in DirettaRingBuffer. With this removal, sinks that reject both
+32-bit and 24-bit receive the existing `throw std::runtime_error("No supported PCM format
+found")` rather than producing corrupt audio. No 16-bit-only target was ever producing
+correct output through this path.
 
-**Step 3: Commit**
+**Step 3: Verify it compiles**
+
+```bash
+make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
+    && echo "Build OK" \
+    || { tail -20 /tmp/slim2d_build.log; echo "Build FAILED"; exit 1; }
+```
+
+Expected: "Build OK".
+
+**Step 4: Commit**
 
 ```bash
 git add diretta/DirettaSync.cpp
-git commit -m "feat(diretta): increment m_poppedFramesTotal at real-pop site in getNewStream"
+git commit -m "feat(diretta): increment m_poppedFramesTotal; remove broken 16-bit sink fallback"
 ```
 
 ---
@@ -194,46 +202,7 @@ retries even under load.
 `firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()`
 which covers both the initial startup window and the post-resume re-prefill.
 
-**Step 3: Fix `sendChunk()` to use `getConsumedBytesPerFrame()`**
-
-The `sendChunk` lambda at line 1329 currently reads:
-
-```cpp
-                        auto sendChunk = [&](size_t frames) -> size_t {
-                            size_t consumedBytes = direttaPtr->sendAudio(
-                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
-                            size_t acceptedFrames = acceptedFramesFromConsumedPcmBytes(
-                                consumedBytes, detectedChannels);
-                            if (acceptedFrames > 0) {
-                                cachePopFrames(acceptedFrames);
-                                pushedFrames += acceptedFrames;
-                            }
-                            return acceptedFrames;
-                        };
-```
-
-`acceptedFramesFromConsumedPcmBytes()` divides by `channels × sizeof(int32_t)`. For 16-bit
-sinks, `sendAudio()`'s direct PCM path returns `frames × channels × 2` (sink bytes), so
-the division gives `frames / 2` — the decode-cache read pointer and `seenPoppedFramesTotal`
-both fall behind, recreating drift. Replace with `getConsumedBytesPerFrame()` (added Task 1):
-
-```cpp
-                        auto sendChunk = [&](size_t frames) -> size_t {
-                            size_t consumedBytes = direttaPtr->sendAudio(
-                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
-                            int cbpf = direttaPtr->getConsumedBytesPerFrame();
-                            size_t acceptedFrames = (cbpf > 0)
-                                ? consumedBytes / static_cast<size_t>(cbpf)
-                                : 0;
-                            if (acceptedFrames > 0) {
-                                cachePopFrames(acceptedFrames);
-                                pushedFrames += acceptedFrames;
-                            }
-                            return acceptedFrames;
-                        };
-```
-
-**Step 4: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
+**Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
 ```bash
 make -j$(nproc) > /tmp/slim2d_build.log 2>&1 \
