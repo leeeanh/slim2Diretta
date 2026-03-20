@@ -2,34 +2,30 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Replace the threshold-based `kRecovery`/`kSteady` PCM sender controller in `src/main.cpp` with a credit-first loop driven by exact consumed-byte accounting from `DirettaSync`.
+**Goal:** Replace the threshold-based `kRecovery`/`kSteady` PCM sender controller in `src/main.cpp` with a credit-first loop driven by exact consumed-frame accounting from `DirettaSync`.
 
-**Architecture:** `DirettaSync` exposes a new monotonic `m_poppedBytesTotal` counter incremented only at the real-pop site in `getNewStream()`. The sender computes `poppedBytesDelta` per wakeup and repays that exact number of decoded frames. Fallback recovery handles the three exceptional cases where the consumer deliberately withholds pops: startup, rebuffering, and producer-done drain.
+**Architecture:** `DirettaSync` exposes a new monotonic `m_poppedFramesTotal` counter incremented at the real-pop site in `getNewStream()` as `currentBytesPerBuffer / m_cachedBytesPerFrame`. The sender computes `poppedFramesDelta` per wakeup and repays that many decoded frames. Fallback recovery handles the three exceptional cases where the consumer deliberately withholds pops: startup/post-resume (detected via `!isPrefillComplete()`), rebuffering, and producer-done drain.
 
 **Design doc:** `docs/plans/2026-03-20-pop-credit-pacing-design.md`
 
-**Tech Stack:** C++17, `std::atomic`, existing `acceptedFramesFromConsumedPcmBytes()` from `src/PcmSenderPolicy.h`
+**Tech Stack:** C++17, `std::atomic`, no new helpers — frame credits are used directly in the sender loop.
 
 ---
 
-### Task 1: Add `m_poppedBytesTotal` and accessors to `DirettaSync`
+### Task 1: Add `m_poppedFramesTotal` and accessors to `DirettaSync`
 
 **Files:**
 - Modify: `diretta/DirettaSync.h:525-529` (Flow Control section, after `getPopEpoch`)
 
-**Step 1: Add the credit counter and three accessors**
+**Step 1: Add the frame credit counter and two accessors**
 
 In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529), insert:
 
 ```cpp
-    alignas(64) std::atomic<uint64_t> m_poppedBytesTotal{0};
+    alignas(64) std::atomic<uint64_t> m_poppedFramesTotal{0};
 
-    uint64_t getPoppedBytesTotal() const {
-        return m_poppedBytesTotal.load(std::memory_order_acquire);
-    }
-
-    size_t getBytesPerBuffer() const {
-        return static_cast<size_t>(m_bytesPerBuffer.load(std::memory_order_acquire));
+    uint64_t getPoppedFramesTotal() const {
+        return m_poppedFramesTotal.load(std::memory_order_acquire);
     }
 
     bool isRebuffering() const {
@@ -37,11 +33,11 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     }
 ```
 
-The exact insertion point is the blank line after the closing `}` of `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
+The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
 
-`m_poppedBytesTotal` uses `alignas(64)` to give it its own cache line, matching the pattern of `m_popEpoch` at line 525.
+`m_poppedFramesTotal` uses `alignas(64)` to give it its own cache line, matching `m_popEpoch` at line 525. `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getPoppedBytesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics. The sender reads `m_popEpoch` first (acquire), then `m_poppedBytesTotal` (acquire); both orderings are required for the `epochDelta > 0 && poppedBytesDelta > 0` guard to be coherent.
+`getBytesPerBuffer()` is not needed: frame credits are used directly in the sender, with no byte-to-frame conversion in the hot path.
 
 **Step 2: Verify it compiles**
 
@@ -55,17 +51,17 @@ Expected: clean build, no new warnings.
 
 ```bash
 git add diretta/DirettaSync.h
-git commit -m "feat(diretta): add m_poppedBytesTotal credit counter and accessors"
+git commit -m "feat(diretta): add m_poppedFramesTotal frame credit counter and accessors"
 ```
 
 ---
 
-### Task 2: Increment `m_poppedBytesTotal` at the real-pop site
+### Task 2: Increment `m_poppedFramesTotal` at the real-pop site
 
 **Files:**
 - Modify: `diretta/DirettaSync.cpp:1837-1841` (real-pop site in `getNewStream()`)
 
-**Step 1: Insert the credit increment before the epoch release**
+**Step 1: Insert the frame credit increment before the epoch release**
 
 In `diretta/DirettaSync.cpp`, the real-pop site currently reads (lines 1837–1841):
 
@@ -84,14 +80,21 @@ Replace with:
     // Pop from ring buffer
     m_ringBuffer.pop(dest, currentBytesPerBuffer);
 
-    // Credit accounting: publish exact consumed bytes before the epoch release.
-    // The release fence on m_popEpoch makes this relaxed store visible to any
-    // thread that acquires m_popEpoch. Order is mandatory — do not swap.
-    m_poppedBytesTotal.fetch_add(currentBytesPerBuffer, std::memory_order_relaxed);
+    // Credit accounting: publish exact frames consumed before the epoch release.
+    // m_cachedBytesPerFrame = channels * bytesPerSample (sink format).
+    // Dividing here gives exact 44 or 45 frames at 44.1 kHz, correct for any sink bit depth.
+    // Guard against zero (brief startup window before format is configured).
+    // Write order is mandatory: relaxed store before release fence on m_popEpoch.
+    if (m_cachedBytesPerFrame > 0) {
+        m_poppedFramesTotal.fetch_add(
+            static_cast<uint64_t>(currentBytesPerBuffer) /
+            static_cast<uint64_t>(m_cachedBytesPerFrame),
+            std::memory_order_relaxed);
+    }
     m_popEpoch.fetch_add(1, std::memory_order_release);
 ```
 
-`m_poppedBytesTotal` is incremented here and **nowhere else**. It must not advance on silence, underrun, or rebuffering returns — all of which return before reaching this line.
+`m_poppedFramesTotal` is incremented here and **nowhere else**. It must not advance on silence, underrun, or rebuffering returns — all of which return before reaching this line.
 
 **Step 2: Verify it compiles**
 
@@ -105,7 +108,7 @@ Expected: clean build.
 
 ```bash
 git add diretta/DirettaSync.cpp
-git commit -m "feat(diretta): increment m_poppedBytesTotal at real-pop site in getNewStream"
+git commit -m "feat(diretta): increment m_poppedFramesTotal at real-pop site in getNewStream"
 ```
 
 ---
@@ -114,9 +117,9 @@ git commit -m "feat(diretta): increment m_poppedBytesTotal at real-pop site in g
 
 **Files:**
 - Modify: `src/main.cpp:1242-1254` (remove `SenderMode` enum and constants)
-- Modify: `src/main.cpp:1327` (expand `seenEpoch` initialization)
+- Modify: `src/main.cpp:1327` (replace `seenEpoch` initialization)
 
-**Step 1: Remove `SenderMode` enum, all threshold constants, and the mode variable**
+**Step 1: Remove `SenderMode` enum, threshold constants, and the mode variable**
 
 Lines 1242–1254 currently read:
 
@@ -136,9 +139,14 @@ Lines 1242–1254 currently read:
                     SenderMode senderMode = SenderMode::kRecovery;
 ```
 
-Delete all 13 lines. The blank line at 1255 can stay.
+Replace all 13 lines with the two recovery constants used in the new loop:
 
-**Step 2: Expand the post-open initialization**
+```cpp
+                    constexpr float  RECOVERY_SEND_MAX_MS     = 10.0f;
+                    constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
+```
+
+**Step 2: Replace the post-open initialization**
 
 Line 1327 currently reads:
 
@@ -149,12 +157,11 @@ Line 1327 currently reads:
 Replace with:
 
 ```cpp
-                        uint64_t seenEpoch            = direttaPtr->getPopEpoch();
-                        uint64_t seenPoppedBytesTotal = direttaPtr->getPoppedBytesTotal();
-                        bool     firstPopReceived     = false;
+                        uint64_t seenEpoch             = direttaPtr->getPopEpoch();
+                        uint64_t seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
 ```
 
-This initialization happens after `direttaPtr->open(audioFmt)` succeeds (line 1314) and must not be moved earlier. Initializing from the live consumer values prevents a spurious large `poppedBytesDelta` on the first wakeup if pre-existing callbacks have already fired.
+Both initialized from live consumer values immediately after `direttaPtr->open(audioFmt)` succeeds (line 1314). `firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()` which covers both the initial startup window and the post-resume re-prefill.
 
 **Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
@@ -162,7 +169,7 @@ This initialization happens after `direttaPtr->open(audioFmt)` succeeds (line 13
 make -j$(nproc) 2>&1 | grep "error:"
 ```
 
-Expected: errors referencing `senderMode`, `STEADY_ENTER`, etc. — this is expected and will be fixed in Task 4.
+Expected: errors referencing `senderMode`, `STEADY_ENTER`, etc. — fixed in Task 4.
 
 ---
 
@@ -173,79 +180,27 @@ Expected: errors referencing `senderMode`, `STEADY_ENTER`, etc. — this is expe
 
 **Step 1: Remove the blind `seenEpoch` overwrite and the threshold controller**
 
-Lines 1425–1468 currently read:
-
-```cpp
-                            seenEpoch = direttaPtr->getPopEpoch();
-
-                            if (direttaPtr->isPaused()) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                                continue;
-                            }
-
-                            // State transition once per wakeup with hysteresis to prevent mode flap.
-                            float level = direttaPtr->getBufferLevel();
-                            if (senderMode == SenderMode::kRecovery && level >= STEADY_ENTER) {
-                                senderMode = SenderMode::kSteady;
-                            } else if (senderMode == SenderMode::kSteady && level < STEADY_EXIT) {
-                                senderMode = SenderMode::kRecovery;
-                            }
-
-                            if (senderMode == SenderMode::kRecovery) {
-                                // level was already sampled for the mode transition — reuse it.
-                                float chunkMs = (level < DEEP_RECOVERY_THRESHOLD)
-                                    ? DEEP_RECOVERY_CHUNK_MS : RECOVERY_CHUNK_MS;
-                                size_t chunkFrames = (rate > 0)
-                                    ? std::clamp(
-                                          static_cast<size_t>(rate * chunkMs / 1000.0f),
-                                          RECOVERY_CHUNK_MIN_FRAMES,
-                                          RECOVERY_CHUNK_MAX_FRAMES)
-                                    : RECOVERY_CHUNK_MIN_FRAMES;
-                                size_t contiguous = cacheContiguousFrames();
-                                if (contiguous > 0) {
-                                    sendChunk(std::min(contiguous, chunkFrames));
-                                }
-                            } else {
-                                size_t steadyChunkFrames = (rate > 0)
-                                    ? std::clamp(
-                                          static_cast<size_t>(rate * STEADY_CHUNK_MS / 1000.0f),
-                                          STEADY_CHUNK_MIN_FRAMES,
-                                          STEADY_CHUNK_MAX_FRAMES)
-                                    : STEADY_CHUNK_MIN_FRAMES;
-
-                                if (direttaPtr->getBufferLevel() < STEADY_CEILING) {
-                                    size_t contiguous = cacheContiguousFrames();
-                                    if (contiguous > 0) {
-                                        sendChunk(std::min(contiguous, steadyChunkFrames));
-                                    }
-                                }
-                            }
-```
-
-Replace with:
+Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPtr->getPopEpoch();` through the closing `}` of the `else` branch). Replace the entire block with:
 
 ```cpp
                             uint64_t currentEpoch       = direttaPtr->getPopEpoch();
-                            uint64_t currentPoppedBytes = direttaPtr->getPoppedBytesTotal();
+                            uint64_t currentFramesTotal = direttaPtr->getPoppedFramesTotal();
+
+                            // Always advance seenEpoch so the condvar predicate stays fresh
+                            // for the next wait. This is independent of credit accounting.
+                            seenEpoch = currentEpoch;
 
                             if (direttaPtr->isPaused()) {
                                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                                 continue;
                             }
 
-                            uint64_t epochDelta       = currentEpoch - seenEpoch;
-                            uint64_t poppedBytesDelta = currentPoppedBytes - seenPoppedBytesTotal;
+                            uint64_t poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal;
 
-                            if (epochDelta > 0 && poppedBytesDelta > 0) {
-                                // Credit path: repay exactly what the consumer popped.
-                                // poppedBytesDelta is in output-format bytes (post-conversion).
-                                // acceptedFramesFromConsumedPcmBytes converts to decoded-cache frames.
-                                firstPopReceived = true;
-
-                                size_t targetCacheFrames =
-                                    acceptedFramesFromConsumedPcmBytes(
-                                        static_cast<size_t>(poppedBytesDelta),
-                                        detectedChannels);
+                            if (poppedFramesDelta > 0) {
+                                // Credit path: frame credits are format-independent.
+                                // No byte-to-frame conversion needed.
+                                size_t targetCacheFrames = static_cast<size_t>(poppedFramesDelta);
 
                                 size_t contiguous   = cacheContiguousFrames();
                                 size_t framesToSend = std::min(targetCacheFrames, contiguous);
@@ -253,29 +208,50 @@ Replace with:
                                     sendChunk(framesToSend);
                                 }
 
-                                seenEpoch            = currentEpoch;
-                                seenPoppedBytesTotal = currentPoppedBytes;
+                                // Advance only by what was sent. Residual at cache wrap boundary
+                                // persists in poppedFramesDelta and is repaid on the next wakeup.
+                                seenPoppedFramesTotal += framesToSend;
+                                continue;
 
-                            } else if (!firstPopReceived ||
+                            } else if (!direttaPtr->isPrefillComplete() ||
                                        direttaPtr->isRebuffering() ||
                                        producerDone.load(std::memory_order_acquire)) {
-                                // Fallback recovery: consumer is deliberately withholding pops
-                                // (startup silence, rebuffering, or producer-done drain).
-                                // Inject from cache until the consumer resumes real pops.
-                                size_t contiguous = cacheContiguousFrames();
-                                if (contiguous > 0) {
-                                    sendChunk(contiguous);
+                                // Fallback recovery: consumer is deliberately withholding pops.
+                                // !isPrefillComplete() covers both initial startup and post-resume:
+                                // resumePlayback() clears the ring and resets m_prefillComplete,
+                                // so the sender correctly re-enters recovery after every unpause.
+
+                                bool draining = producerDone.load(std::memory_order_acquire);
+
+                                if (!draining) {
+                                    // Startup / rebuffering: check threshold BEFORE sending.
+                                    // Without this guard a single wakeup can fill the ring to
+                                    // capacity, adding latency far above the 20% resume point.
+                                    if (direttaPtr->getBufferLevel() >=
+                                            DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
+                                        continue;
+                                    }
+
+                                    // Cap per-iteration send to bound ring fill per wakeup.
+                                    size_t recoveryCapFrames = (rate > 0)
+                                        ? static_cast<size_t>(rate * RECOVERY_SEND_MAX_MS / 1000.0f)
+                                        : RECOVERY_SEND_MIN_FRAMES;
+
+                                    size_t contiguous = cacheContiguousFrames();
+                                    if (contiguous > 0) {
+                                        sendChunk(std::min(contiguous, recoveryCapFrames));
+                                    }
+                                } else {
+                                    // Producer done: drain remaining decoded cache without ceiling.
+                                    // Natural-end detection fires once bufferedBytes reaches zero.
+                                    size_t contiguous = cacheContiguousFrames();
+                                    if (contiguous > 0) {
+                                        sendChunk(contiguous);
+                                    }
                                 }
 
-                                // Exit recovery immediately on first real pop.
+                                // Exit recovery immediately on first resumed real pop.
                                 if (direttaPtr->getPopEpoch() != seenEpoch) {
-                                    continue;
-                                }
-
-                                // Stop injecting once ring is at rebuffer-resume threshold;
-                                // consumer will resume real pops at this level.
-                                if (direttaPtr->getBufferLevel() >=
-                                        DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
                                     continue;
                                 }
                             }
@@ -288,7 +264,7 @@ Replace with:
 make -j$(nproc) 2>&1 | head -40
 ```
 
-Expected: zero errors and zero new warnings. The `senderMode`, `STEADY_ENTER`, etc. references were the only users of the removed declarations.
+Expected: zero errors and zero new warnings. The `senderMode`, `STEADY_ENTER`, etc. references from the old controller were the only consumers of the removed declarations.
 
 **Step 3: Commit**
 
@@ -315,19 +291,21 @@ The condvar fallback wait predicate (non-EVL path) currently references `seenEpo
                                         std::chrono::milliseconds(2));
 ```
 
-This predicate uses `seenEpoch` to detect new pops while waiting. In the new design `seenEpoch` is a `uint64_t` local updated only in the credit path — the same variable, same semantics. **No change is needed here.** Verify by inspection that the predicate still compiles and references the same `seenEpoch` declared at line 1327.
+In the new design `seenEpoch` is advanced unconditionally at the top of each iteration (step 3 in the per-wakeup sequence), after the wait returns. While waiting, `seenEpoch` holds the value written at the end of the previous iteration, so the predicate correctly detects pops that arrive during the current sleep. Semantics are unchanged. **No edit needed here.**
+
+Verify by inspection that the predicate compiles and that `seenEpoch` still refers to the local declared in Task 3 Step 2:
 
 ```bash
 make -j$(nproc) 2>&1 | grep -i "seenEpoch\|error"
 ```
 
-Expected: no errors; `seenEpoch` resolves to the local from Task 3.
+Expected: no errors.
 
 ---
 
 ### Task 6: Runtime verification
 
-No automated test harness exists (see `CLAUDE.md`). Verify manually against the five criteria from the design doc.
+No automated test harness exists (see `CLAUDE.md`). Verify manually against the six criteria from the design doc.
 
 **Criterion 1 — 44.1 kHz steady-state: no ring occupancy leak**
 
@@ -338,28 +316,36 @@ Run a multi-minute 44.1 kHz FLAC track with `--verbose`. Observe `[Sender]` log 
 [Sender] iter=1000 ... direttaBytes=<N ± small variance>
 ```
 
-**Criterion 2 — Pause/resume: 100ms sleep, not 2ms poll**
+**Criterion 2 — Pause/resume: no deadlock, playback restarts**
 
-Pause playback via LMS. Confirm `[Sender]` log lines stop appearing at the 500-iteration cadence (they would appear every ~1s at 2ms poll; they should be absent for the full pause duration at 100ms sleep).
+Pause via LMS, wait 5 seconds, resume. Confirm:
+- Playback restarts without hanging
+- `[Sender]` recovery log entries appear after resume (ring cleared, `!isPrefillComplete()` fires)
+- Credit mode resumes after the first real pop following re-prefill
 
-**Criterion 3 — Rebuffer episode: credit resumes cleanly**
+**Criterion 3 — Rebuffer episode: recovery injects correctly, threshold is respected**
 
-Simulate a network stall by pausing the LMS HTTP stream momentarily (or throttle the network). Confirm:
-- `[DirettaSync] Buffer underrun — entering rebuffering mode` appears in logs
-- After recovery: `[DirettaSync] Rebuffering complete` appears
-- Playback continues without a permanent stall
-- `m_poppedBytesTotal` does not advance during the silence period (verify by adding a temporary `LOG_DEBUG` after the credit-path entry check: it should not fire during rebuffering)
+Simulate a network stall. Confirm:
+- `[DirettaSync] Buffer underrun — entering rebuffering mode` appears
+- Recovery injects in bounded chunks (not one bulk fill)
+- `[DirettaSync] Rebuffering complete` appears
+- Playback continues without permanent stall
+- `m_poppedFramesTotal` does not advance during silence returns (credit mode does not fire during the stall)
 
 **Criterion 4 — Startup: no spurious initial credit**
 
-Enable verbose logging and start a track. Confirm the credit path fires only after the first `[DirettaSync] getNewStream #N` with a real pop (not during stabilization silence). There should be no `[Sender]` credit-path log on the very first wakeup before any real pop.
+Start a track with verbose logging. Confirm the credit path fires only after the first `[DirettaSync] getNewStream #N` with a real pop. No credit-path entries during the stabilization silence period.
 
 **Criterion 5 — Producer-done drain: natural end fires**
 
 Play a short track to completion. Confirm:
-- `[Sender] Natural stream end declared` appears in logs
+- `[Sender] Natural stream end declared` appears
 - `STMd` and `STMu` stats are sent (visible as LMS track advance)
 - No hang at end of track
+
+**Criterion 6 — Non-32-bit sink: no ring drift**
+
+If a 16-bit or 24-bit output target is available, play a 44.1 kHz track for several minutes. Confirm `direttaBytes` stays flat (same as Criterion 1). The frame credit unit is format-independent: this verifies no under-repayment on non-32-bit sinks.
 
 **Step: Final commit if any runtime fixups were made**
 
