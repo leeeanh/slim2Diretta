@@ -126,14 +126,23 @@ which correctly covers both the startup window and post-resume re-prefill (see b
 2. Read currentEpoch      = direttaPtr->getPopEpoch()
         currentFramesTotal = direttaPtr->getPoppedFramesTotal()
 3. seenEpoch = currentEpoch   // always advance; keeps condvar predicate fresh each iteration
-4. If direttaPtr->isPaused(): sleep 100ms, continue.    // preserve current paused behavior
-5. Compute poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal
-6. If poppedFramesDelta > 0: run credit path.
-7. Else if !direttaPtr->isPrefillComplete()
+4. If direttaPtr->isPaused():
+       seenPoppedFramesTotal = currentFramesTotal   // discard credits accumulated during pause:
+                                                    // resumePlayback() clears the ring but
+                                                    // m_poppedFramesTotal is monotonic; without
+                                                    // this sync, the first post-resume wakeup
+                                                    // repays pre-pause pops into a fresh ring.
+       sleep 100ms, continue.
+5. If audioFmtReady: updateElapsed()               // call unconditionally before branching —
+                                                    // the credit path's early continue would
+                                                    // otherwise skip it every steady-state wakeup.
+6. Compute poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal
+7. If poppedFramesDelta > 0: run credit path.
+8. Else if !direttaPtr()->isPrefillComplete()
         || direttaPtr->isRebuffering()
         || producerDone.load(std::memory_order_acquire):
        run fallback recovery.
-8. Else: continue waiting.
+9. Else: continue waiting.
 ```
 
 **Note on `isPrefillComplete()` replacing `firstPopReceived`**: `resumePlayback()` clears the

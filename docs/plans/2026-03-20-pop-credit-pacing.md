@@ -191,8 +191,20 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                             seenEpoch = currentEpoch;
 
                             if (direttaPtr->isPaused()) {
+                                // Discard credits accumulated during the paused window.
+                                // resumePlayback() clears the ring but m_poppedFramesTotal is
+                                // monotonic — without this sync the first post-resume wakeup
+                                // repays pre-pause pops into a fresh ring, over-injecting.
+                                seenPoppedFramesTotal = currentFramesTotal;
                                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                                 continue;
+                            }
+
+                            // Call before the credit/recovery branch so it is reached on every
+                            // non-paused wakeup. The credit path's early continue would otherwise
+                            // skip it in the steady-state case, freezing track progress reporting.
+                            if (audioFmtReady.load(std::memory_order_relaxed)) {
+                                updateElapsed();
                             }
 
                             uint64_t poppedFramesDelta = currentFramesTotal - seenPoppedFramesTotal;
