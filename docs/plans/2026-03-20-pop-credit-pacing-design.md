@@ -167,7 +167,7 @@ which correctly covers both the startup window and post-resume re-prefill (see b
 **Note on `isPrefillComplete()` replacing `firstPopReceived`**: `resumePlayback()` clears the
 ring buffer and resets `m_prefillComplete = false` (DirettaSync.cpp line 1497). With
 `firstPopReceived = true` still set, the original design had no recovery condition that could
-fire, deadlocking the sender. `!isPrefillComplete()` is false both at initial startup and
+fire, deadlocking the sender. `!isPrefillComplete()` is **true** both at initial startup and
 after any resume that resets the prefill gate, which is exactly when recovery injection is
 required.
 
@@ -198,11 +198,12 @@ if (poppedFramesDelta > 0) {
 `m_poppedFramesTotal` are in the same unit as the decoded cache (one frame = one sample point
 per channel), so no conversion is needed.
 
-**Residual handling**: `seenPoppedFramesTotal` advances only by `framesToSend`. If
-`cacheContiguousFrames()` is smaller than `targetCacheFrames` (circular cache wrap boundary
-or partial `sendAudio()` acceptance), the unpaid residual persists as future credit. On the
-next wakeup the residual is included in `poppedFramesDelta` and repaid before new pop credits
-are stacked on top.
+**Residual handling**: `seenPoppedFramesTotal` advances only by `actualSent` (the frames
+actually accepted by `sendAudio()`). If `cacheContiguousFrames()` is smaller than
+`targetCacheFrames` (circular cache wrap boundary), or if `sendChunk()` accepts fewer frames
+than requested (ring temporarily overfilled by a recovery burst), the unpaid residual persists
+as future credit. On the next wakeup the residual is included in `poppedFramesDelta` and
+repaid before new pop credits are stacked on top.
 
 **Invariant**: if the cache has sufficient contiguous frames, each consumer pop is repaid by
 the same number of decoded input frames, restoring ring occupancy to exactly its pre-pop
