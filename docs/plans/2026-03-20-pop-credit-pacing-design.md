@@ -66,24 +66,20 @@ uint64_t getPoppedFramesTotal() const {
 bool isRebuffering() const {
     return m_rebuffering.load(std::memory_order_acquire);
 }
-
-// Returns channels * bytesPerSample for the negotiated sink format.
-// Exposes the existing m_bytesPerFrame atomic so sendChunk() can convert
-// sendAudio() byte return to frames without hardcoding sizeof(int32_t).
-// Necessary for correct operation on 16-bit and 24-bit Diretta sinks.
-int getSinkBytesPerFrame() const {
-    return m_bytesPerFrame.load(std::memory_order_acquire);
-}
 ```
 
 `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getSinkBytesPerFrame()` exposes the existing `m_bytesPerFrame` (already declared at
-DirettaSync.h line 656). `sendChunk()` uses it to replace the `acceptedFramesFromConsumedPcmBytes()`
-call that hardcodes `sizeof(int32_t)`, making frame-to-byte accounting correct for all sink depths.
-
 `getBytesPerBuffer()` and `getFramesPerBuffer()` are not needed: the sender uses frame credits
 directly and does not re-derive the SDK frame quantum.
+
+`getSinkBytesPerFrame()` is **not** needed. `sendAudio()` consistently returns **input bytes
+consumed** (not sink bytes written): `push24BitPacked()` returns `samplesWritten * 4` (input
+int32_t units); the direct push returns `frames × channels × 4`. Because `audioFmt.bitDepth`
+is forced to 32 (main.cpp line 1157) for all PCM inputs (DoP is also packed as int32_t-aligned
+frames), the decode cache is always int32_t for all paths that reach `sendChunk()`. The
+existing `acceptedFramesFromConsumedPcmBytes()` dividing by `channels × sizeof(int32_t)` is
+therefore correct across all supported sink bit depths — no change to `sendChunk()` is required.
 
 ### `diretta/DirettaSync.cpp` — real-pop site in `getNewStream()`
 
@@ -120,9 +116,20 @@ of sink bit depth.
 Immediately after `direttaPtr->open(audioFmt)` succeeds:
 
 ```cpp
-uint64_t seenEpoch             = direttaPtr->getPopEpoch();
-uint64_t seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
+uint64_t seenEpoch, seenPoppedFramesTotal;
+do {
+    seenEpoch             = direttaPtr->getPopEpoch();
+    seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
+} while (direttaPtr->getPopEpoch() != seenEpoch);
 ```
+
+`open()` calls `play()` before returning, so real pops can already be racing. If a pop lands
+between the two loads, `seenEpoch` holds epoch N while `seenPoppedFramesTotal` already includes
+pop N+1. The first sender iteration wakes on the epoch change but computes
+`poppedFramesDelta == 0`, permanently dropping one pop credit. The retry loop re-reads until
+the epoch is unchanged across both loads, guaranteeing a consistent pair. The loop body
+executes once in the common case (pops are rare at open) and at most a handful of times even
+under load, making it cheaper than any locking alternative.
 
 Both initialized from live consumer values after `open()`. If initialized to zero and
 pre-existing callbacks have already fired (e.g., format-change reopen), the first delta
@@ -327,6 +334,6 @@ added.
 
 | File | Change |
 |---|---|
-| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()`, `getSinkBytesPerFrame()` |
+| `diretta/DirettaSync.h` | add `m_poppedFramesTotal`, `getPoppedFramesTotal()`, `isRebuffering()` |
 | `diretta/DirettaSync.cpp` | increment `m_poppedFramesTotal` (frames, not bytes) before `m_popEpoch` at real-pop site |
-| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; fix `sendChunk()` to use `getSinkBytesPerFrame()`; split recovery by `draining` flag |
+| `src/main.cpp` | replace `kRecovery`/`kSteady` controller with credit-first loop; consistent snapshot retry at init; split recovery by `draining` flag |

@@ -31,20 +31,18 @@ In `diretta/DirettaSync.h`, after the existing `getPopEpoch()` block (line 529),
     bool isRebuffering() const {
         return m_rebuffering.load(std::memory_order_acquire);
     }
-
-    // Returns channels * bytesPerSample for the negotiated sink format.
-    // Used by sendChunk() to convert sendAudio() byte return to frames without
-    // hardcoding sizeof(int32_t), so 16-bit and 24-bit Diretta sinks are correct.
-    int getSinkBytesPerFrame() const {
-        return m_bytesPerFrame.load(std::memory_order_acquire);
-    }
 ```
 
 The insertion point is the blank line after `getPopEpoch()` at line 529, before the `//=== Target Management ===` comment at line 531.
 
 `m_poppedFramesTotal` uses `alignas(64)` to give it its own cache line, matching `m_popEpoch` at line 525. `getPoppedFramesTotal()` uses `memory_order_acquire` to match `getPopEpoch()` semantics.
 
-`getSinkBytesPerFrame()` exposes the existing `m_bytesPerFrame` atomic (already at DirettaSync.h line 656), used to fix `sendChunk()` in Task 3.
+`getSinkBytesPerFrame()` is **not** added. `sendAudio()` consistently returns input bytes
+consumed (not sink bytes): `push24BitPacked()` returns `samplesWritten * 4` (int32_t units)
+regardless of sink depth. Since `audioFmt.bitDepth` is forced to 32 in main.cpp, the decode
+cache is always int32_t for all paths that reach `sendChunk()`. The existing
+`acceptedFramesFromConsumedPcmBytes(consumedBytes, detectedChannels)` dividing by
+`channels * sizeof(int32_t)` is therefore correct — no change to `sendChunk()` is required.
 
 **Step 2: Verify it compiles**
 
@@ -164,53 +162,30 @@ Line 1327 currently reads:
 Replace with:
 
 ```cpp
-                        uint64_t seenEpoch             = direttaPtr->getPopEpoch();
-                        uint64_t seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
+                        uint64_t seenEpoch, seenPoppedFramesTotal;
+                        do {
+                            seenEpoch             = direttaPtr->getPopEpoch();
+                            seenPoppedFramesTotal = direttaPtr->getPoppedFramesTotal();
+                        } while (direttaPtr->getPopEpoch() != seenEpoch);
 ```
 
-Both initialized from live consumer values immediately after `direttaPtr->open(audioFmt)` succeeds (line 1314). `firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()` which covers both the initial startup window and the post-resume re-prefill.
+`open()` calls `play()` before returning, so pops can race the two loads. If a pop lands
+between them, `seenEpoch` holds epoch N while `seenPoppedFramesTotal` already includes pop
+N+1. The first sender iteration wakes on the epoch change but computes `poppedFramesDelta == 0`,
+permanently dropping one credit. The retry loop re-reads until the epoch is unchanged across
+both loads, guaranteeing a consistent pair. Typically executes once; at most a handful of
+retries even under load.
 
-**Step 3: Fix `sendChunk()` to use the negotiated sink frame size**
+`firstPopReceived` is not needed: the recovery condition uses `!direttaPtr->isPrefillComplete()`
+which covers both the initial startup window and the post-resume re-prefill.
 
-The lambda at line 1329 currently reads:
+`sendChunk()` is **not changed**. `sendAudio()` consistently returns input bytes consumed
+(not sink bytes): `push24BitPacked()` returns `samplesWritten * 4` (int32_t units). Since
+`audioFmt.bitDepth` is forced to 32, the cache is always int32_t for all paths that reach
+`sendChunk()`, so `acceptedFramesFromConsumedPcmBytes(consumedBytes, detectedChannels)`
+dividing by `channels * sizeof(int32_t)` is correct for all supported sink depths.
 
-```cpp
-                        auto sendChunk = [&](size_t frames) -> size_t {
-                            size_t consumedBytes = direttaPtr->sendAudio(
-                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
-                            size_t acceptedFrames = acceptedFramesFromConsumedPcmBytes(
-                                consumedBytes, detectedChannels);
-                            if (acceptedFrames > 0) {
-                                cachePopFrames(acceptedFrames);
-                                pushedFrames += acceptedFrames;
-                            }
-                            return acceptedFrames;
-                        };
-```
-
-`acceptedFramesFromConsumedPcmBytes()` divides by `channels * sizeof(int32_t)`. On 16-bit or 24-bit Diretta sinks `sendAudio()` returns fewer bytes per frame than 4, so `acceptedFrames` is undercounted — the decode-cache read pointer and `seenPoppedFramesTotal` both fall behind, causing the same replay drift the credit controller is meant to eliminate.
-
-Replace with:
-
-```cpp
-                        auto sendChunk = [&](size_t frames) -> size_t {
-                            size_t consumedBytes = direttaPtr->sendAudio(
-                                reinterpret_cast<const uint8_t*>(cacheReadPtr()), frames);
-                            int sinkBpf = direttaPtr->getSinkBytesPerFrame();
-                            size_t acceptedFrames = (sinkBpf > 0)
-                                ? consumedBytes / static_cast<size_t>(sinkBpf)
-                                : 0;
-                            if (acceptedFrames > 0) {
-                                cachePopFrames(acceptedFrames);
-                                pushedFrames += acceptedFrames;
-                            }
-                            return acceptedFrames;
-                        };
-```
-
-`getSinkBytesPerFrame()` returns `m_bytesPerFrame` (channels × bytesPerSample for the negotiated sink format), added in Task 1. This makes `sendChunk()` format-independent without touching call sites.
-
-**Step 4: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
+**Step 3: Verify it compiles** (will fail until Task 4 removes the `senderMode` uses)
 
 ```bash
 make -j$(nproc) 2>&1 | grep "error:"
