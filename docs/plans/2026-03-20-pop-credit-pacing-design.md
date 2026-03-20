@@ -151,14 +151,17 @@ if (poppedFramesDelta > 0) {
 
     size_t contiguous   = cacheContiguousFrames();
     size_t framesToSend = std::min(targetCacheFrames, contiguous);
+    size_t actualSent   = 0;
     if (framesToSend > 0) {
-        sendChunk(framesToSend);
+        actualSent = sendChunk(framesToSend);
     }
 
-    // Advance by exactly what was sent, not by the full delta.
-    // Any unsent residual (cache wrap boundary, partial sendAudio acceptance)
-    // remains in poppedFramesDelta on the next wakeup and is repaid then.
-    seenPoppedFramesTotal += framesToSend;
+    // Advance only by frames actually accepted by sendAudio().
+    // sendChunk() returns acceptedFrames which can be less than framesToSend if the
+    // ring is temporarily overfilled (e.g. from a recovery burst). Advancing by
+    // the full request would discard the shortfall from poppedFramesDelta,
+    // reintroducing drift. Any unaccepted residual persists and is repaid next wakeup.
+    seenPoppedFramesTotal += actualSent;
     continue;
 }
 ```
@@ -194,10 +197,15 @@ constexpr size_t RECOVERY_SEND_MIN_FRAMES = 256;
     bool draining = producerDone.load(std::memory_order_acquire);
 
     if (!draining) {
-        // Startup / rebuffering: check threshold BEFORE sending to prevent overshoot.
-        // Injecting past REBUFFER_THRESHOLD_PCT would add unnecessary latency before
-        // real pops resume. The SDK resumes real pops once this threshold is crossed.
-        if (direttaPtr->getBufferLevel() >= DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
+        // Rebuffering only: gate on threshold before injecting.
+        // When isRebuffering() is true, DirettaSync exits rebuffering once avail crosses
+        // REBUFFER_THRESHOLD_PCT, so the sender must not overshoot that point.
+        // When !isPrefillComplete() is true (startup/post-resume), do NOT apply this gate:
+        // getNewStream() keeps returning silence until avail >= m_prefillTarget, which can
+        // be well above 20% (e.g. FLAC prefill is 40% of a 500ms ring). Stopping at 20%
+        // here would deadlock startup by preventing the ring from ever reaching m_prefillTarget.
+        if (direttaPtr->isRebuffering() &&
+            direttaPtr->getBufferLevel() >= DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
             continue;
         }
 

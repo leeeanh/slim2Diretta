@@ -204,13 +204,17 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
 
                                 size_t contiguous   = cacheContiguousFrames();
                                 size_t framesToSend = std::min(targetCacheFrames, contiguous);
+                                size_t actualSent   = 0;
                                 if (framesToSend > 0) {
-                                    sendChunk(framesToSend);
+                                    actualSent = sendChunk(framesToSend);
                                 }
 
-                                // Advance only by what was sent. Residual at cache wrap boundary
-                                // persists in poppedFramesDelta and is repaid on the next wakeup.
-                                seenPoppedFramesTotal += framesToSend;
+                                // Advance only by frames actually accepted by sendAudio().
+                                // sendChunk() can accept fewer than requested if the ring is
+                                // temporarily overfilled (e.g. from a recovery burst).
+                                // Advancing by the full request would discard the shortfall,
+                                // reintroducing drift. Residual persists and is repaid next wakeup.
+                                seenPoppedFramesTotal += actualSent;
                                 continue;
 
                             } else if (!direttaPtr->isPrefillComplete() ||
@@ -224,10 +228,15 @@ Lines 1425–1468 currently read (the block starting with `seenEpoch = direttaPt
                                 bool draining = producerDone.load(std::memory_order_acquire);
 
                                 if (!draining) {
-                                    // Startup / rebuffering: check threshold BEFORE sending.
-                                    // Without this guard a single wakeup can fill the ring to
-                                    // capacity, adding latency far above the 20% resume point.
-                                    if (direttaPtr->getBufferLevel() >=
+                                    // Rebuffering only: gate on threshold BEFORE sending.
+                                    // When isRebuffering() is true, DirettaSync exits rebuffering
+                                    // once avail crosses REBUFFER_THRESHOLD_PCT, so stop there.
+                                    // Do NOT apply this gate for !isPrefillComplete() (startup /
+                                    // post-resume): FLAC prefill target is 40% of the ring (200ms
+                                    // of a 500ms buffer). Stopping at 20% here would prevent the
+                                    // ring from ever reaching m_prefillTarget, deadlocking startup.
+                                    if (direttaPtr->isRebuffering() &&
+                                            direttaPtr->getBufferLevel() >=
                                             DirettaBuffer::REBUFFER_THRESHOLD_PCT) {
                                         continue;
                                     }
